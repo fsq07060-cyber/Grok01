@@ -28,9 +28,12 @@ hiddenimports = [
     "packaging.specifiers",
     "packaging.requirements",
     "yt_dlp",
+    "yt_dlp_ejs",
 ]
 # yt-dlp 提取器/后处理：collect 保证 onedir 不缺模块
 hiddenimports += collect_submodules("yt_dlp")
+hiddenimports += collect_submodules("yt_dlp_ejs")
+datas += collect_data_files("yt_dlp_ejs")
 
 a = Analysis(
     ["main.py"],
