@@ -98,6 +98,23 @@ class ClipboardWatcher:
         self.enabled = False
         self._stop.set()
 
+    def poll(self) -> None:
+        """检查一次剪贴板。必须在 Tk 主线程调用，clipboard_get 不能跨线程。"""
+        if not self.enabled or self._stop.is_set():
+            return
+        try:
+            url = extract_video_url(self._read())
+        except Exception:
+            return
+        now = time.monotonic()
+        if url and (url != self._last_url or (now - self._last_fire) >= self.cooldown_sec):
+            self._last_url = url
+            self._last_fire = now
+            try:
+                self.on_url(url)
+            except Exception:
+                pass
+
     def set_enabled(self, value: bool) -> None:
         if value:
             self.start()

@@ -3,17 +3,19 @@
 
 from __future__ import annotations
 
+import queue
 import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox
-from typing import Dict, Optional
+from typing import Callable, Dict, Optional
 
 import customtkinter as ctk
 
 from core import separator as sep
 from core.clipboard_watch import ClipboardWatcher
 from core.downloader import list_formats
+from core.errors import format_probe_failure_dialog, friendly_error, run_probe_batch
 from core.platform_util import open_directory, open_file
 from core.task_model import DownloadTask, TaskStatus
 from core.task_queue import DownloadQueue
@@ -23,6 +25,7 @@ from core.url_parse import parse_urls
 RESOLUTIONS = ["best", "2160", "1440", "1080", "720", "480", "audio"]
 VIDEO_FORMATS = ["mp4", "webm", "mkv", "best"]
 AUDIO_FORMATS = ["m4a", "mp3", "opus", "best"]
+BROWSER_MENU = ["不使用", "chrome", "edge", "firefox"]
 DEFAULT_CONCURRENCY = 2
 
 
@@ -47,6 +50,17 @@ class TaskRow(ctk.CTkFrame):
 
         self.lbl_pct = ctk.CTkLabel(self, text=f"{task.progress:.0f}%", width=48)
         self.lbl_pct.grid(row=1, column=2, padx=4, pady=2)
+
+        self.lbl_error = ctk.CTkLabel(
+            self,
+            text="",
+            anchor="w",
+            justify="left",
+            wraplength=760,
+            text_color=("#b00020", "#ff8a80"),
+        )
+        self.lbl_error.grid(row=2, column=0, columnspan=3, sticky="ew", padx=8, pady=(0, 6))
+        self.lbl_error.grid_remove()
 
         btn_frm = ctk.CTkFrame(self, fg_color="transparent")
         btn_frm.grid(row=0, column=2, rowspan=2, padx=4, pady=4)
@@ -80,6 +94,15 @@ class TaskRow(ctk.CTkFrame):
         self.btn_open_file.configure(state="normal" if done else "disabled")
         has_dir = bool(task.output_dir) or bool(task.filepath)
         self.btn_open_dir.configure(state="normal" if has_dir else "disabled")
+        if task.status == TaskStatus.FAILED:
+            self.lbl_status.configure(text_color=("#b00020", "#ff8a80"))
+        else:
+            self.lbl_status.configure(text_color=("gray10", "#DCE4EE"))
+        if task.status == TaskStatus.FAILED and task.error:
+            self.lbl_error.configure(text=task.error)
+            self.lbl_error.grid()
+        else:
+            self.lbl_error.grid_remove()
 
     def _open_file(self) -> None:
         self.app.open_task_file(self.task_id)
@@ -95,13 +118,17 @@ class App(ctk.CTk):
     def __init__(self) -> None:
         super().__init__()
         self.title("流媒体下载器 · 人声/伴奏分离")
-        self.geometry("900x720")
-        self.minsize(720, 560)
+        self.geometry("920x800")
+        self.minsize(760, 640)
 
         ctk.set_appearance_mode("System")
         ctk.set_default_color_theme("blue")
 
         self._clipboard_prompting = False
+        self._probing = False
+        self._closing = False
+        self._ui_queue: queue.Queue[Callable[[], None]] = queue.Queue()
+        self._clip_ticks = 0
         self._rows: Dict[str, TaskRow] = {}
 
         demucs_ok, demucs_msg = sep.check_status()
@@ -121,17 +148,18 @@ class App(ctk.CTk):
             on_url=self._on_clipboard_url,
             get_clipboard=self._safe_clipboard_get,
         )
-        if self.var_clip.get():
-            self._watcher.start()
+        # 在主线程轮询。后台线程里 clipboard_get / after() 会和 Tk 抢锁，窗口会「未响应」。
+        self._watcher.enabled = bool(self.var_clip.get())
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.after(30, self._drain_ui)
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self) -> None:
         pad = {"padx": 12, "pady": 6}
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(6, weight=1)
         self.grid_rowconfigure(7, weight=1)
+        self.grid_rowconfigure(8, weight=1)
 
         # 批量 URL
         frm_url = ctk.CTkFrame(self)
@@ -150,9 +178,10 @@ class App(ctk.CTk):
         ctk.CTkButton(btn_row, text="添加任务", width=120, command=self._on_add).pack(
             side="left", padx=4
         )
-        ctk.CTkButton(btn_row, text="探测首个链接", width=120, command=self._on_probe).pack(
-            side="left", padx=4
+        self.btn_probe = ctk.CTkButton(
+            btn_row, text="探测全部链接", width=140, command=self._on_probe
         )
+        self.btn_probe.pack(side="left", padx=4)
         ctk.CTkButton(
             btn_row,
             text="清空输入",
@@ -160,6 +189,14 @@ class App(ctk.CTk):
             fg_color="gray40",
             command=self._clear_url_input,
         ).pack(side="left", padx=4)
+        ctk.CTkLabel(
+            frm_url,
+            text="「探测全部链接」会逐条检查输入框里的每个 URL（后台进行，不卡住窗口）。某一条失败不会让后面的链接被跳过。",
+            text_color="gray60",
+            anchor="w",
+            justify="left",
+            wraplength=840,
+        ).grid(row=3, column=0, columnspan=3, sticky="ew", padx=8, pady=(0, 8))
 
         # 保存路径
         frm_path = ctk.CTkFrame(self)
@@ -209,9 +246,35 @@ class App(ctk.CTk):
             command=self._on_conc_change,
         ).grid(row=0, column=7, padx=4, pady=8, sticky="w")
 
+        # Cookie（默认关闭；YouTube 提示 bot/登录时再填）
+        frm_ck = ctk.CTkFrame(self)
+        frm_ck.grid(row=3, column=0, sticky="ew", **pad)
+        frm_ck.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(frm_ck, text="Cookie 文件").grid(row=0, column=0, padx=8, pady=(8, 4))
+        self.var_cookie_file = tk.StringVar(value="")
+        ctk.CTkEntry(
+            frm_ck,
+            textvariable=self.var_cookie_file,
+            placeholder_text="可选，Netscape 格式 cookies.txt",
+        ).grid(row=0, column=1, sticky="ew", padx=8, pady=(8, 4))
+        ctk.CTkButton(frm_ck, text="浏览…", width=100, command=self._browse_cookie).grid(
+            row=0, column=2, padx=8, pady=(8, 4)
+        )
+        ctk.CTkLabel(frm_ck, text="浏览器 Cookie").grid(row=1, column=0, padx=8, pady=(4, 8))
+        self.var_browser = tk.StringVar(value="不使用")
+        ctk.CTkOptionMenu(frm_ck, variable=self.var_browser, values=BROWSER_MENU, width=140).grid(
+            row=1, column=1, padx=8, pady=(4, 4), sticky="w"
+        )
+        ctk.CTkLabel(
+            frm_ck,
+            text="默认不使用。YouTube 提示 bot/登录时再选浏览器或填写 Netscape Cookie 文件。",
+            text_color="gray60",
+            anchor="w",
+        ).grid(row=2, column=0, columnspan=3, sticky="ew", padx=8, pady=(0, 8))
+
         # 开关行
         frm_sw = ctk.CTkFrame(self)
-        frm_sw.grid(row=3, column=0, sticky="ew", **pad)
+        frm_sw.grid(row=4, column=0, sticky="ew", **pad)
 
         self.var_separate = tk.BooleanVar(value=False)
         self.chk_sep = ctk.CTkCheckBox(
@@ -234,7 +297,7 @@ class App(ctk.CTk):
 
         # 状态
         frm_stat = ctk.CTkFrame(self)
-        frm_stat.grid(row=4, column=0, sticky="ew", **pad)
+        frm_stat.grid(row=5, column=0, sticky="ew", **pad)
         self.lbl_status = ctk.CTkLabel(frm_stat, text="就绪", anchor="w")
         self.lbl_status.pack(side="left", padx=12, pady=8, fill="x", expand=True)
 
@@ -242,40 +305,68 @@ class App(ctk.CTk):
             "合规提示：请仅下载你有权获取的内容；使用 NSFW 站点时请遵守当地法律与网站条款。"
         )
         ctk.CTkLabel(self, text=tip, text_color="gray60", wraplength=860, justify="left").grid(
-            row=5, column=0, sticky="ew", padx=12, pady=(0, 4)
+            row=6, column=0, sticky="ew", padx=12, pady=(0, 4)
         )
 
-        # 任务列表（row 6）+ 日志（row 7）
-        self.task_list = ctk.CTkScrollableFrame(self, height=200, label_text="下载任务")
-        self.task_list.grid(row=6, column=0, sticky="nsew", padx=12, pady=(4, 6))
+        # 任务列表（row 7）+ 日志（row 8）
+        self.task_list = ctk.CTkScrollableFrame(self, height=180, label_text="下载任务")
+        self.task_list.grid(row=7, column=0, sticky="nsew", padx=12, pady=(4, 6))
         self.task_list.grid_columnconfigure(0, weight=1)
 
         # 日志
-        self.log_box = ctk.CTkTextbox(self, height=140)
-        self.log_box.grid(row=7, column=0, sticky="nsew", padx=12, pady=(4, 12))
-        self._log("欢迎使用流媒体下载器。可一次粘贴多个链接后点击「添加任务」。")
+        self.log_box = ctk.CTkTextbox(self, height=120)
+        self.log_box.grid(row=8, column=0, sticky="nsew", padx=12, pady=(4, 12))
+        self._log("欢迎使用流媒体下载器。可一次粘贴多个链接后点击「添加任务」（每条单独入队，失败互不影响）。")
+        self._log("「探测全部链接」会逐条检查，失败的 URL 会写进日志；不会只测第一条。")
         self._log(self._demucs_msg)
         self._log(f"默认并发：{DEFAULT_CONCURRENCY}（可在上方调整）")
 
     # ------------------------------------------------------------------ helpers
+    def _ui(self, fn: Callable[[], None]) -> None:
+        """只在 Tk 主线程碰控件。工作线程只入队。"""
+        if self._closing:
+            return
+        if threading.current_thread() is threading.main_thread():
+            fn()
+            return
+        self._ui_queue.put(fn)
+
+    def _drain_ui(self) -> None:
+        if self._closing:
+            return
+        try:
+            while True:
+                fn = self._ui_queue.get_nowait()
+                try:
+                    fn()
+                except Exception:
+                    pass
+        except queue.Empty:
+            pass
+        self._clip_ticks += 1
+        if self._clip_ticks >= 33:
+            self._clip_ticks = 0
+            try:
+                self._watcher.poll()
+            except Exception:
+                pass
+        try:
+            self.after(30, self._drain_ui)
+        except Exception:
+            return
+
     def _log(self, msg: str) -> None:
         def append() -> None:
             self.log_box.insert("end", msg + "\n")
             self.log_box.see("end")
 
-        if threading.current_thread() is threading.main_thread():
-            append()
-        else:
-            self.after(0, append)
+        self._ui(append)
 
     def _set_status(self, text: str) -> None:
         def upd() -> None:
             self.lbl_status.configure(text=text)
 
-        if threading.current_thread() is threading.main_thread():
-            upd()
-        else:
-            self.after(0, upd)
+        self._ui(upd)
 
     def _safe_clipboard_get(self) -> str:
         try:
@@ -287,6 +378,23 @@ class App(ctk.CTk):
         path = filedialog.askdirectory(initialdir=self.var_path.get() or None)
         if path:
             self.var_path.set(path)
+
+    def _browse_cookie(self) -> None:
+        current = self.var_cookie_file.get().strip()
+        initial = str(Path(current).parent) if current else str(Path.home())
+        path = filedialog.askopenfilename(
+            title="选择 Netscape Cookie 文件",
+            initialdir=initial if Path(initial).is_dir() else str(Path.home()),
+            filetypes=[("Cookie 文本", "*.txt"), ("所有文件", "*.*")],
+        )
+        if path:
+            self.var_cookie_file.set(path)
+
+    def _cookie_settings(self) -> tuple[str, str]:
+        browser = self.var_browser.get().strip()
+        if browser in ("不使用", "none", "无"):
+            browser = ""
+        return self.var_cookie_file.get().strip(), browser
 
     def _clear_url_input(self) -> None:
         self.txt_urls.delete("1.0", "end")
@@ -308,7 +416,7 @@ class App(ctk.CTk):
             )
 
     def _on_clip_toggle(self) -> None:
-        self._watcher.set_enabled(bool(self.var_clip.get()))
+        self._watcher.enabled = bool(self.var_clip.get())
 
     def _on_clipboard_url(self, url: str) -> None:
         def ask() -> None:
@@ -334,11 +442,12 @@ class App(ctk.CTk):
             finally:
                 self._clipboard_prompting = False
 
-        self.after(0, ask)
+        self._ui(ask)
 
     def _current_opts_snapshot(self) -> dict:
         res = self.var_res.get()
         out = self.var_path.get().strip()
+        cookiefile, browser = self._cookie_settings()
         return {
             "output_dir": out,
             "resolution": res,
@@ -346,6 +455,8 @@ class App(ctk.CTk):
             "audio_format": self.var_afmt.get(),
             "audio_only": (res == "audio"),
             "want_separate": bool(self.var_separate.get()),
+            "cookiefile": cookiefile,
+            "cookiesfrombrowser": browser,
         }
 
     def _on_add(self) -> None:
@@ -358,8 +469,8 @@ class App(ctk.CTk):
         if not out:
             messagebox.showwarning("提示", "请选择保存路径。")
             return
-        Path(out).mkdir(parents=True, exist_ok=True)
-
+        # 不在主线程 mkdir。F: 这类未就绪盘符会卡住 CreateDirectory，
+        # 窗口变成「未响应」，而且任务行还没创建。目录改由下载线程准备。
         snap = self._current_opts_snapshot()
         added = 0
         for url in urls:
@@ -368,36 +479,88 @@ class App(ctk.CTk):
             self._ensure_row(task)
             added += 1
 
-        self._log(f"已添加 {added} 个任务（并发上限 {self._queue.max_workers}）")
+        cookie_note = []
+        if snap.get("cookiefile"):
+            cookie_note.append("Cookie 文件")
+        if snap.get("cookiesfrombrowser"):
+            cookie_note.append(f"浏览器 {snap['cookiesfrombrowser']}")
+        extra = f"（{'、'.join(cookie_note)}）" if cookie_note else ""
+        self._log(
+            f"已添加 {added} 个任务（并发上限 {self._queue.max_workers}）{extra}。"
+            "保存目录在后台创建，不会卡住窗口。"
+        )
         self._set_status(f"队列中 / 已添加 {added} 个")
         self._clear_url_input()
+        self.update_idletasks()
 
     def _on_probe(self) -> None:
+        if self._probing:
+            return
         text = self.txt_urls.get("1.0", "end")
         urls = parse_urls(text)
         if not urls:
             messagebox.showwarning("提示", "请先粘贴至少一个视频链接。")
             return
-        url = urls[0]
+        # Cookie 文件是否存在放到探测线程里检查，避免主线程踩到慢盘。
+        cookiefile, browser = self._cookie_settings()
+
+        self._probing = True
+        self.btn_probe.configure(state="disabled", text="探测中…")
+        format_limit = 30 if len(urls) == 1 else 8
 
         def work() -> None:
             try:
-                self._set_status("探测中…")
-                result = list_formats(url, log=self._log)
-                lines = [f"标题：{result.title}", f"共 {len(result.formats)} 个格式（节选）："]
-                for f in result.formats[:30]:
-                    size = f"{f.filesize // 1024 // 1024}MB" if f.filesize else "?"
-                    lines.append(
-                        f"  [{f.format_id}] {f.ext} {f.resolution} {f.note} ({size})"
+                self._set_status(f"探测中 0/{len(urls)}…")
+                self._log(f"开始逐条探测 {len(urls)} 个链接（某一条失败不会跳过其余链接）")
+
+                def probe_one(url: str) -> str:
+                    result = list_formats(
+                        url,
+                        log=self._log,
+                        cookiefile=cookiefile,
+                        cookiesfrombrowser=browser,
                     )
-                if len(result.formats) > 30:
-                    lines.append(f"  … 其余 {len(result.formats) - 30} 项省略")
-                self._log("\n".join(lines))
-                self._set_status("探测完成")
+                    lines = [
+                        f"标题：{result.title}",
+                        f"共 {len(result.formats)} 个格式（节选）：",
+                    ]
+                    for fmt in result.formats[:format_limit]:
+                        size = f"{fmt.filesize // 1024 // 1024}MB" if fmt.filesize else "?"
+                        lines.append(
+                            f"  [{fmt.format_id}] {fmt.ext} {fmt.resolution} {fmt.note} ({size})"
+                        )
+                    if len(result.formats) > format_limit:
+                        lines.append(f"  … 其余 {len(result.formats) - format_limit} 项省略")
+                    self._log("\n".join(lines))
+                    return f"{result.title}（{len(result.formats)} 个格式）"
+
+                batch = run_probe_batch(urls, probe_one, self._log)
+                summary = (
+                    f"探测结束：成功 {len(batch.successes)}，失败 {len(batch.failures)}，"
+                    f"未探测 {len(batch.untested)}，共 {len(urls)}"
+                )
+                self._log(summary)
+                self._set_status(summary)
+                dialog = format_probe_failure_dialog(batch)
+                if dialog:
+                    self._ui(lambda m=dialog: messagebox.showerror("探测失败", m))
             except Exception as e:
-                self._log(f"探测失败：{e}")
+                reason = friendly_error(e)
+                self._log(f"探测中断：{reason}")
                 self._set_status("探测失败")
-                self.after(0, lambda: messagebox.showerror("探测失败", str(e)))
+                self._ui(
+                    lambda m=reason: messagebox.showerror(
+                        "探测失败",
+                        m + "\n\n若输入框里还有其它链接，请看日志确认哪些还没测。",
+                    )
+                )
+            finally:
+                def enable() -> None:
+                    self._probing = False
+                    if self.btn_probe.winfo_exists():
+                        self.btn_probe.configure(state="normal", text="探测全部链接")
+
+                self._ui(enable)
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -424,9 +587,12 @@ class App(ctk.CTk):
             n_dl = sum(1 for t in tasks if t.status == TaskStatus.DOWNLOADING)
             n_q = sum(1 for t in tasks if t.status == TaskStatus.QUEUED)
             n_ok = sum(1 for t in tasks if t.status == TaskStatus.COMPLETED)
-            self._set_status(f"下载中 {n_dl} · 排队 {n_q} · 完成 {n_ok} · 共 {len(tasks)}")
+            n_fail = sum(1 for t in tasks if t.status == TaskStatus.FAILED)
+            self._set_status(
+                f"下载中 {n_dl} · 排队 {n_q} · 完成 {n_ok} · 失败 {n_fail} · 共 {len(tasks)}"
+            )
 
-        self.after(0, apply)
+        self._ui(apply)
 
     def open_task_file(self, task_id: str) -> None:
         task = self._queue.get(task_id)
@@ -466,6 +632,7 @@ class App(ctk.CTk):
         self._log(f"已移除任务 {task_id}")
 
     def _on_close(self) -> None:
+        self._closing = True
         self._watcher.stop()
         self._queue.stop()
         self.destroy()
