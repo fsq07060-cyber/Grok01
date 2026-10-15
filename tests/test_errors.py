@@ -171,7 +171,15 @@ class CookieOptionTests(unittest.TestCase):
         opts = DownloadOptions(url="https://example.test/v", output_dir=".")
         self.assertEqual(opts.cookiefile, "")
         self.assertEqual(opts.cookiesfrombrowser, "")
-        self.assertIn("height<=?1080", build_format_selector(opts))
+        spec = build_format_selector(opts)
+        self.assertIn("height<=?1080", spec)
+        self.assertIn("ba[ext=m4a]", spec)
+        for branch in spec.split("/"):
+            if branch.startswith("bv"):
+                self.assertIn("+", branch, branch)
+            else:
+                self.assertIn("acodec!=none", branch)
+                self.assertIn("vcodec!=none", branch)
 
 
 class QueueFailureLogTests(unittest.TestCase):

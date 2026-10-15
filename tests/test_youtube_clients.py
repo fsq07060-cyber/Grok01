@@ -15,7 +15,7 @@ from core.downloader import (
     is_youtube_url,
     list_formats,
 )
-from core.errors import YOUTUBE_COOKIES_NEEDED
+from core.errors import FORMAT_NEEDS_AUDIO, YOUTUBE_COOKIES_NEEDED
 
 YT = "https://www.youtube.com/watch?v=BmKFJgVLE-Q"
 KNOWN = {
@@ -205,6 +205,25 @@ class YoutubeRetryTests(unittest.TestCase):
         self.assertIn("年龄限制", str(ctx.exception))
         self.assertEqual(len(_FakeYDL.calls), 5)
         self.assertEqual(_clients(_FakeYDL.calls[-1]), ["tv_downgraded"])
+
+    def test_format_unavailable_retries_clients_then_chinese(self) -> None:
+        script = [RuntimeError("ERROR: Requested format is not available. Use --list-formats")] * 5
+        with mock.patch("core.downloader._supported_player_clients", return_value=set(KNOWN)):
+            with _install_fake(script):
+                with self.assertRaises(RuntimeError) as ctx:
+                    list_formats(YT)
+        self.assertEqual(str(ctx.exception), FORMAT_NEEDS_AUDIO)
+        self.assertNotIn("不用 Cookie", str(ctx.exception))
+        self.assertEqual(len(_FakeYDL.calls), 5)
+        self.assertEqual(_clients(_FakeYDL.calls[-1]), ["tv_downgraded"])
+
+    def test_non_youtube_format_unavailable_does_not_retry(self) -> None:
+        with _install_fake([RuntimeError("Requested format is not available")]):
+            with self.assertRaises(RuntimeError) as ctx:
+                list_formats("https://example.com/v")
+        self.assertEqual(len(_FakeYDL.calls), 1)
+        self.assertEqual(str(ctx.exception), FORMAT_NEEDS_AUDIO)
+        self.assertIsNone(_clients(_FakeYDL.calls[0]))
 
     def test_non_youtube_403_does_not_retry_or_set_player_client(self) -> None:
         with _install_fake([RuntimeError("HTTP Error 403: Forbidden")]):
