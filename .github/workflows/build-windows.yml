@@ -1,0 +1,72 @@
+# Windows onedir 打包：产出 dist/StreamDownloader/（含 StreamDownloader.exe + 随包 ffmpeg）
+# 触发：push 到 main，或手动 workflow_dispatch
+name: Build Windows
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Download Windows ffmpeg (BtbN static, exe only)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip"
+          Write-Host "Downloading $url ..."
+          Invoke-WebRequest -Uri $url -OutFile ffmpeg-win64.zip -UseBasicParsing
+          Expand-Archive -Path ffmpeg-win64.zip -DestinationPath ffmpeg_extract -Force
+          New-Item -ItemType Directory -Force -Path "ffmpeg\bin" | Out-Null
+          $ffmpeg = Get-ChildItem -Path ffmpeg_extract -Recurse -Filter ffmpeg.exe | Select-Object -First 1
+          $ffprobe = Get-ChildItem -Path ffmpeg_extract -Recurse -Filter ffprobe.exe | Select-Object -First 1
+          if (-not $ffmpeg -or -not $ffprobe) {
+            throw "ffmpeg.exe or ffprobe.exe not found in archive"
+          }
+          Copy-Item $ffmpeg.FullName "ffmpeg\bin\ffmpeg.exe" -Force
+          Copy-Item $ffprobe.FullName "ffmpeg\bin\ffprobe.exe" -Force
+          Remove-Item ffmpeg-win64.zip -Force
+          Remove-Item ffmpeg_extract -Recurse -Force
+          Get-ChildItem "ffmpeg\bin" | Format-Table Name, Length
+
+      - name: PyInstaller (onedir)
+        run: |
+          pyinstaller --noconfirm build_windows.spec
+          if (-not (Test-Path "dist\StreamDownloader\StreamDownloader.exe")) {
+            throw "Expected dist\StreamDownloader\StreamDownloader.exe missing"
+          }
+          # 双保险：若 spec 未打进 datas，再复制 ffmpeg
+          if (Test-Path "ffmpeg\bin\ffmpeg.exe") {
+            New-Item -ItemType Directory -Force -Path "dist\StreamDownloader\ffmpeg\bin" | Out-Null
+            Copy-Item "ffmpeg\bin\*.exe" "dist\StreamDownloader\ffmpeg\bin\" -Force
+          }
+          Get-ChildItem "dist\StreamDownloader" -Recurse -Depth 2 | Select-Object FullName, Length | Format-Table -AutoSize
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: StreamDownloader-windows
+          path: dist/StreamDownloader/
+          retention-days: 14
+          if-no-files-found: error

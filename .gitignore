@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.spec.bak
+ffmpeg/bin/*.exe
+ffmpeg/bin/*.dll
+!ffmpeg/bin/.gitkeep
+StreamDownloader-windows.zip
+dist-windows/

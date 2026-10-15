@@ -1,0 +1,8 @@
+# v1 必需
+customtkinter>=5.2.0
+yt-dlp>=2024.1.0
+
+# v2 可选（人声/伴奏分离）；按需安装，勿与重型 CUDA 轮子强绑
+# demucs>=4.0.0
+# torch
+# torchaudio
