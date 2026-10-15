@@ -267,9 +267,11 @@ class App(ctk.CTk):
         )
         ctk.CTkLabel(
             frm_ck,
-            text="默认不使用。YouTube 提示 bot/登录时再选浏览器或填写 Netscape Cookie 文件。",
+            text="默认不用 Cookie。YouTube 会自动换客户端；年龄限制或地区限制仍失败时，再选浏览器或 Netscape Cookie 文件。",
             text_color="gray60",
             anchor="w",
+            justify="left",
+            wraplength=860,
         ).grid(row=2, column=0, columnspan=3, sticky="ew", padx=8, pady=(0, 8))
 
         # 开关行

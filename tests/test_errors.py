@@ -12,9 +12,11 @@ from unittest import mock
 
 from core.downloader import DownloadOptions, DownloadResult, apply_cookie_options, build_format_selector
 from core.errors import (
+    YOUTUBE_COOKIES_NEEDED,
     ProbeBatchResult,
     format_probe_failure_dialog,
     friendly_error,
+    is_youtube_client_retryable,
     run_probe_batch,
 )
 from core.task_model import DownloadTask, TaskStatus
@@ -63,6 +65,27 @@ class FriendlyErrorTests(unittest.TestCase):
     def test_cookie_load_failure(self) -> None:
         exc = RuntimeError("ERROR: failed to load cookies")
         self.assertIn("无法读取 Cookie", friendly_error(exc))
+
+    def test_youtube_cookies_needed_wins_over_bot_cause(self) -> None:
+        err = RuntimeError(YOUTUBE_COOKIES_NEEDED)
+        err.__cause__ = RuntimeError("Sign in to confirm you're not a bot")
+        self.assertEqual(friendly_error(err), YOUTUBE_COOKIES_NEEDED)
+
+    def test_retryable_403_bot_and_cookie_not_410(self) -> None:
+        self.assertTrue(
+            is_youtube_client_retryable(RuntimeError("unable to download video data: HTTP Error 403: Forbidden"))
+        )
+        self.assertTrue(is_youtube_client_retryable(RuntimeError("Sign in to confirm you're not a bot")))
+        self.assertTrue(is_youtube_client_retryable(RuntimeError("failed to load cookies")))
+        self.assertTrue(
+            is_youtube_client_retryable(
+                RuntimeError("Playback on other websites has been disabled by the video owner")
+            )
+        )
+        self.assertFalse(is_youtube_client_retryable(RuntimeError("HTTP Error 410: Gone")))
+        self.assertFalse(is_youtube_client_retryable(RuntimeError("HTTP Error 404: Not Found")))
+        self.assertFalse(is_youtube_client_retryable(RuntimeError("已取消")))
+        self.assertFalse(is_youtube_client_retryable(RuntimeError("不支持的浏览器 Cookie：safari")))
 
 
 class ProbeBatchTests(unittest.TestCase):

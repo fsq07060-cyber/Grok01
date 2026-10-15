@@ -13,6 +13,10 @@ _HTTP_404_RE = re.compile(
     r"HTTP(?:\s+Error)?\s*404\b|\b404\s*:?\s*Not\s*Found\b|\b404\b",
     re.IGNORECASE,
 )
+_HTTP_403_RE = re.compile(
+    r"HTTP(?:\s+Error)?\s*403\b|\b403\s*:?\s*Forbidden\b",
+    re.IGNORECASE,
+)
 _COOKIE_FAIL_RE = re.compile(
     r"failed to load cookies|cookie 文件不存在|无法读取 cookie|不支持的浏览器|"
     r"could not copy .{0,40}cookie|cookies database|could not find .{0,40}cookie",
@@ -22,12 +26,24 @@ _BOT_RE = re.compile(
     r"not a bot|sign in to confirm|login required|age[- ]restricted|use --cookies",
     re.IGNORECASE,
 )
+# 某个 player client 自己拒绝，换下一个客户端仍可能成功。
+_CLIENT_REJECT_RE = re.compile(
+    r"playback on other websites has been disabled|"
+    r"drm[- ]protected|only images are available",
+    re.IGNORECASE,
+)
 
 _GONE_MESSAGE = "该视频已失效或已删除 (HTTP {code})"
 _COOKIE_MESSAGE = "无法读取 Cookie。请确认浏览器可用，或改用 Netscape 格式的 Cookie 文件。"
 _BOT_MESSAGE = (
     "需要登录或 Cookie（站点判定为机器人/要求登录）。"
     "请在界面选择浏览器 Cookie，或填写 Netscape 格式 Cookie 文件后重试。"
+)
+# YouTube 无 Cookie 客户端都试过之后的最后提示。不是「每条都能下」。
+YOUTUBE_COOKIES_NEEDED = (
+    "这个视频不用 Cookie 仍无法下载（YouTube 返回 403 或要求登录）。"
+    "年龄限制或部分地区限制的视频可能仍需要 Cookie："
+    "可在界面选择浏览器 Cookie，或填写 Netscape 格式的 Cookie 文件后再试。"
 )
 
 
@@ -103,6 +119,44 @@ def is_cookie_load_failure(exc: BaseException) -> bool:
     return _COOKIE_FAIL_RE.search(blob) is not None
 
 
+def is_youtube_client_retryable(exc: BaseException) -> bool:
+    """
+    YouTube 换下一个 player client 还有意义的失败：
+    HTTP 403、登录/机器人确认、Cookie 读失败、嵌入或 DRM 被这个客户端拒绝。
+    404/410、取消、不支持的浏览器名称不再重试。
+    """
+    if "已取消" in str(exc):
+        return False
+    if missing_media_code(exc) in (404, 410):
+        return False
+    blob = _exception_blob(exc)
+    if "不支持的浏览器" in blob:
+        return False
+    if is_cookie_load_failure(exc):
+        return True
+    if _HTTP_403_RE.search(blob):
+        return True
+    if _BOT_RE.search(blob):
+        return True
+    if _CLIENT_REJECT_RE.search(blob):
+        return True
+    return False
+
+
+def youtube_retry_reason(exc: BaseException) -> str:
+    """日志里的短原因，避免在还有下一个客户端时弹出「请先填 Cookie」。"""
+    if is_cookie_load_failure(exc):
+        return "无法读取 Cookie"
+    blob = _exception_blob(exc)
+    if _HTTP_403_RE.search(blob):
+        return "HTTP 403"
+    if _BOT_RE.search(blob):
+        return "需要登录确认"
+    if _CLIENT_REJECT_RE.search(blob):
+        return "该客户端不可用"
+    return "失败"
+
+
 def _short_reason(text: str, limit: int = 180) -> str:
     text = re.sub(r"^ERROR:\s*", "", (text or "").strip(), flags=re.IGNORECASE)
     text = " ".join(text.split())
@@ -120,12 +174,14 @@ def friendly_error(exc: BaseException) -> str:
     """
     if isinstance(exc, str):
         exc = RuntimeError(exc)
+    blob = _exception_blob(exc)
+    if YOUTUBE_COOKIES_NEEDED in blob:
+        return YOUTUBE_COOKIES_NEEDED
     code = missing_media_code(exc)
     if code in (404, 410):
         return _GONE_MESSAGE.format(code=code)
     if is_cookie_load_failure(exc):
         return _COOKIE_MESSAGE
-    blob = _exception_blob(exc)
     if _BOT_RE.search(blob):
         return _BOT_MESSAGE
     return _short_reason(str(exc))

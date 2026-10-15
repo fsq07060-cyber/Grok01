@@ -26,6 +26,7 @@ python main.py
 | 探测全部链接（逐条成功/失败） | v1.2 |
 | 可选 Cookie 文件 / 浏览器 Cookie（默认关闭） | v1.2 |
 | 失效视频（HTTP 410/404）中文提示 | v1.2 |
+| YouTube 默认不读 Cookie，403 / 登录确认时自动换客户端 | v1.3 |
 | 人声/伴奏分离（Demucs） | v2（UI 开关 + stub） |
 
 ## 使用提示
@@ -36,14 +37,11 @@ python main.py
 4. **删除**：未完成会取消并移除；已完成仅从列表移除。  
 5. 剪贴板监听开启时，检测到链接会询问是否追加到输入框。
 
-## YouTube 提示登录 / 机器人
+## YouTube
 
-默认不读取 Cookie。若 YouTube 提示 “Sign in to confirm you’re not a bot” 或要求登录：
+普通公开视频默认不读 Cookie。程序会按 yt-dlp 2026.10 的推荐客户端依次尝试 `tv_samsung`、`visionos`、`web`，失败再试 `visionos`、`web_embedded`、`tv_downgraded`（不使用已删除的 `tv_embedded`，也不使用没有 PO Token 就会 403 的 `android` / `ios` / `mweb`）。HTTP 403、「Sign in to confirm」或 Cookie 读失败会自动换下一个客户端。本机有 Deno 或 Node 时，`tv_samsung` / `web` 的清晰度更完整；没有时仍会用 `visionos`（不需要 JS）。
 
-1. 在「浏览器 Cookie」选择 **chrome** / **edge** / **firefox**（本机已安装该浏览器），或  
-2. 用浏览器扩展导出 **Netscape** 格式的 `cookies.txt`，填到「Cookie 文件」。
-
-两条都填时会一起传给 yt-dlp（`cookiesfrombrowser` 与 `cookiefile`）。浏览器正在占用 Cookie 数据库时可能读失败，关掉浏览器或改用导出的文件即可。
+年龄限制或部分地区封锁的视频仍可能需要 Cookie，不能保证每条都成功。最后才需要：在「浏览器 Cookie」选 **chrome** / **edge** / **firefox**，或填写 Netscape 格式的 `cookies.txt`。两条都填时会一起传给 yt-dlp。浏览器正在占用 Cookie 数据库时可能读失败，关掉浏览器或改用导出的文件即可；读失败后仍会再试无 Cookie 客户端。
 
 Pornhub 等站点返回 **HTTP 410 / 404** 表示该视频已删除或下架，换一条还能打开的链接即可，不是下载器坏了。
 
