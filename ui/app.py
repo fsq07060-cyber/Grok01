@@ -117,7 +117,7 @@ class TaskRow(ctk.CTkFrame):
 class App(ctk.CTk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("流媒体下载器 · 人声/伴奏分离")
+        self.title("流媒体下载器 v1.3.1 · 人声/伴奏分离")
         self.geometry("920x800")
         self.minsize(760, 640)
 

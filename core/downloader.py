@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import re
+import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
@@ -12,11 +13,15 @@ from typing import Any, Callable, Optional
 from urllib.parse import urlparse
 
 from core.errors import (
+    FORMAT_NEEDS_AUDIO,
+    NO_AUDIO_TRACK,
     YOUTUBE_COOKIES_NEEDED,
     friendly_error,
+    is_format_unavailable,
     is_youtube_client_retryable,
     youtube_retry_reason,
 )
+from core.ffmpeg_path import ensure_bundled_ffmpeg, resolve_tool
 
 
 ProgressCallback = Callable[[str], None]
@@ -59,6 +64,7 @@ class DownloadResult:
     title: str
     filepath: Optional[str]
     output_dir: str
+    video_id: str = ""
 
 
 def _import_yt_dlp():
@@ -76,31 +82,119 @@ def _resolution_height(res: str) -> Optional[int]:
     return int(m.group(1)) if m else None
 
 
+def _merge_container(video_format: str) -> str:
+    if video_format in ("mp4", "webm", "mkv"):
+        return video_format
+    return "mp4"
+
+
+def _is_audio_only(opts: DownloadOptions) -> bool:
+    return bool(opts.audio_only or opts.resolution == "audio")
+
+
+def _height_filter(resolution: str) -> str:
+    height = _resolution_height(resolution)
+    return f"[height<=?{height}]" if height else ""
+
+
+def _dedupe(items: list[str]) -> list[str]:
+    out: list[str] = []
+    for item in items:
+        if item not in out:
+            out.append(item)
+    return out
+
+
+def _audio_terms(container: str, audio_format: str) -> list[str]:
+    """音轨选择，从左到右。mp4 先放 aac/m4a，方便直接封装而不是只下画面。"""
+    requested: list[str] = []
+    if audio_format == "m4a":
+        requested += ["ba[ext=m4a]", "ba[acodec^=mp4a]"]
+    elif audio_format == "mp3":
+        requested += ["ba[ext=mp3]", "ba[acodec^=mp3]"]
+    elif audio_format == "opus":
+        requested += ["ba[acodec^=opus]", "ba[ext=webm]"]
+    elif audio_format not in ("best", ""):
+        requested.append(f"ba[ext={audio_format}]")
+
+    compatible: list[str] = []
+    if container == "mp4":
+        compatible += ["ba[ext=m4a]", "ba[acodec^=mp4a]"]
+    elif container == "webm":
+        compatible += ["ba[acodec^=opus]", "ba[ext=webm]"]
+
+    # mp4 必须能 remux：aac/m4a 排在用户指定的其它编码前面。
+    if container == "mp4":
+        terms = compatible + requested + ["ba"]
+    else:
+        terms = requested + compatible + ["ba"]
+    return _dedupe(terms)
+
+
+def _video_terms(container: str, video_format: str, height_filter: str) -> list[str]:
+    terms: list[str] = []
+    ext = video_format if video_format in ("mp4", "webm", "mkv") else ""
+    if ext:
+        terms.append(f"bv*{height_filter}[ext={ext}]")
+    elif container == "mp4":
+        terms.append(f"bv*{height_filter}[ext=mp4]")
+    elif container == "webm":
+        terms.append(f"bv*{height_filter}[ext=webm]")
+    terms.append(f"bv*{height_filter}")
+    if height_filter:
+        terms.append("bv*")
+    return _dedupe(terms)
+
+
+def _with_audio_fallbacks(videos: list[str], audios: list[str], height_filter: str) -> str:
+    """每个 `/` 分支都是「画面+声音」或自带音轨的单文件。`+` 比 `/` 更紧，不能把 bv* 单独放在斜线左边。"""
+    parts = [f"{video}+{audio}" for video in videos for audio in audios]
+    if height_filter:
+        parts.append(f"b{height_filter}[vcodec!=none][acodec!=none]")
+    parts.append("b[vcodec!=none][acodec!=none]")
+    return "/".join(parts)
+
+
 def build_format_selector(opts: DownloadOptions) -> str:
-    """根据 UI 选项构造 yt-dlp format 字符串。"""
-    if opts.audio_only or opts.resolution == "audio":
+    """根据 UI 选项构造 yt-dlp format 字符串。普通下载永远合并音视频。"""
+    if _is_audio_only(opts):
         af = opts.audio_format
         if af == "best":
             return "bestaudio/best"
         return f"ba[ext={af}]/bestaudio/best"
 
-    height = _resolution_height(opts.resolution)
-    vf = opts.video_format
-    af = opts.audio_format
+    container = _merge_container(opts.video_format)
+    height_filter = _height_filter(opts.resolution)
+    return _with_audio_fallbacks(
+        _video_terms(container, opts.video_format, height_filter),
+        _audio_terms(container, opts.audio_format),
+        height_filter,
+    )
 
-    height_filter = f"[height<=?{height}]" if height else ""
 
-    if vf == "best":
-        video = f"bv*{height_filter}/b{height_filter}"
-    else:
-        video = f"bv*{height_filter}[ext={vf}]/bv*{height_filter}/b{height_filter}"
+def build_audio_retry_selector(opts: DownloadOptions) -> str:
+    """第一次下到无声文件时用的更宽格式：不限容器，仍然必须有音轨。"""
+    container = _merge_container(opts.video_format)
+    height_filter = _height_filter(opts.resolution)
+    videos = [f"bv*{height_filter}"] if height_filter else []
+    videos.append("bv*")
+    return _with_audio_fallbacks(
+        _dedupe(videos),
+        _audio_terms(container, opts.audio_format),
+        height_filter,
+    )
 
-    if af == "best":
-        audio = "ba"
-    else:
-        audio = f"ba[ext={af}]/ba"
 
-    return f"{video}+{audio}/b{height_filter}/best"
+def format_sort_for(opts: DownloadOptions) -> Optional[list[str]]:
+    """同一清晰度下，mp4 优先 h264+aac，这样 ffmpeg 可以复制流而不是丢掉声音。"""
+    if _is_audio_only(opts):
+        return None
+    container = _merge_container(opts.video_format)
+    if container == "mp4":
+        return ["res", "fps", "vcodec:h264", "acodec:aac"]
+    if container == "webm":
+        return ["res", "fps", "vcodec:vp9", "acodec:opus"]
+    return None
 
 
 _BROWSER_ALIASES = {
@@ -316,6 +410,11 @@ def _extract_with_retries(
                 raise
             if "已取消" in str(exc):
                 raise
+            if is_format_unavailable(exc):
+                if youtube and index < total:
+                    log("这个客户端没有可合并的音视频格式，正在改试下一个客户端…")
+                    continue
+                raise RuntimeError(FORMAT_NEEDS_AUDIO) from exc
             if youtube and is_youtube_client_retryable(exc) and index < total:
                 last_retryable = exc
                 log(f"本次未成功（{youtube_retry_reason(exc)}），正在改试下一个客户端…")
@@ -495,6 +594,158 @@ def ensure_output_dir(
     return Path(path)
 
 
+_MEDIA_SUFFIXES = {
+    ".mp4",
+    ".mkv",
+    ".webm",
+    ".m4a",
+    ".mp3",
+    ".opus",
+    ".ogg",
+    ".aac",
+    ".flv",
+    ".mov",
+    ".ts",
+    ".m4v",
+}
+_INTERMEDIATE_RE = re.compile(r"\.f\d+\.")
+
+
+def file_has_audio(path: Optional[str]) -> Optional[bool]:
+    """
+    ffprobe 是否看到音轨。
+    True/False 表示已经确认；None 表示文件不存在或 ffprobe 没跑成，不能据此判失败。
+    """
+    if not path:
+        return None
+    file_path = Path(path)
+    if not file_path.is_file():
+        return None
+    probe = resolve_tool("ffprobe")
+    if not probe:
+        return None
+    try:
+        proc = subprocess.run(
+            [
+                probe,
+                "-v",
+                "error",
+                "-select_streams",
+                "a",
+                "-show_entries",
+                "stream=codec_type",
+                "-of",
+                "csv=p=0",
+                str(file_path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    return "audio" in (proc.stdout or "").lower()
+
+
+def _candidate_files(out_dir: Path, filepath: Optional[str], video_id: str) -> list[Path]:
+    found: list[Path] = []
+    seen: set[Path] = set()
+
+    def add(path: Path) -> None:
+        if path.suffix.lower() not in _MEDIA_SUFFIXES:
+            return
+        if not path.is_file():
+            return
+        try:
+            key = path.resolve()
+        except OSError:
+            key = path
+        if key in seen:
+            return
+        seen.add(key)
+        found.append(path)
+
+    if filepath:
+        primary = Path(filepath)
+        add(primary)
+        merged_name = _INTERMEDIATE_RE.sub(".", primary.name)
+        if merged_name != primary.name:
+            add(primary.with_name(merged_name))
+    if video_id and out_dir.is_dir():
+        needle = f"[{video_id}]"
+        try:
+            children = list(out_dir.iterdir())
+        except OSError:
+            children = []
+        for child in children:
+            if needle in child.name:
+                add(child)
+    return found
+
+
+def _file_rank(path: Path, container: str) -> tuple[int, int, int]:
+    intermediate = 1 if _INTERMEDIATE_RE.search(path.name) else 0
+    ext_penalty = 0 if path.suffix.lower().lstrip(".") == container else 1
+    try:
+        size = path.stat().st_size
+    except OSError:
+        size = 0
+    return (intermediate, ext_penalty, -size)
+
+
+def select_downloaded_file(
+    out_dir: Path,
+    filepath: Optional[str],
+    video_id: str,
+    container: str,
+) -> tuple[Optional[Path], Optional[bool]]:
+    """在合并结果和临时视频里挑一个。只要有一条带音轨，就用那一条。"""
+    candidates = _candidate_files(out_dir, filepath, video_id)
+    if not candidates:
+        return None, None
+    probed = [(path, file_has_audio(str(path))) for path in candidates]
+    audible = [path for path, has in probed if has is True]
+    if audible:
+        audible.sort(key=lambda path: _file_rank(path, container))
+        return audible[0], True
+    if all(has is False for _, has in probed):
+        return probed[0][0], False
+    return candidates[0], None
+
+
+def _delete_files(paths: list[Path], log: ProgressCallback) -> None:
+    for path in paths:
+        try:
+            path.unlink()
+        except OSError as exc:
+            log(f"无法删除无声文件：{path}（{exc}）")
+
+
+def drop_silent_siblings(
+    out_dir: Path,
+    filepath: Optional[str],
+    video_id: str,
+    keep: Path,
+    log: ProgressCallback,
+) -> None:
+    """合并结果已经有声音时，删掉旁边只剩画面的临时文件，避免打开错文件。"""
+    try:
+        keep_key = keep.resolve()
+    except OSError:
+        keep_key = keep
+    for path in _candidate_files(out_dir, filepath, video_id):
+        try:
+            key = path.resolve()
+        except OSError:
+            key = path
+        if key == keep_key:
+            continue
+        if file_has_audio(str(path)) is False:
+            _delete_files([path], log)
+
+
 def download(
     opts: DownloadOptions,
     log: Optional[ProgressCallback] = None,
@@ -504,49 +755,51 @@ def download(
     """
     执行下载。返回 DownloadResult（含最终文件路径，若可解析）。
     保存目录在本函数（工作线程）里创建，失败只影响这一条任务。
+    普通视频下载必须带音轨。ffprobe 确认没有声音时会换格式重试一次，仍没有则失败。
     """
     log = log or (lambda _m: None)
+    ensure_bundled_ffmpeg()
     log(f"准备保存目录：{opts.output_dir}")
     out_dir = ensure_output_dir(opts.output_dir, cancel_event=cancel_event)
 
     fmt = build_format_selector(opts)
-
+    container = _merge_container(opts.video_format)
     outtmpl = str(out_dir / "%(title)s [%(id)s].%(ext)s")
-
-    merge_format = opts.video_format if opts.video_format in ("mp4", "webm", "mkv") else "mp4"
     hook = _ProgressHook(log, on_progress=on_progress, cancel_event=cancel_event)
 
-    if opts.audio_only or opts.resolution == "audio":
-        postprocessors = [
+    ydl_opts: dict[str, Any] = {
+        "format": fmt,
+        "outtmpl": outtmpl,
+        "noplaylist": True,
+        "progress_hooks": [hook],
+        "quiet": True,
+        "no_warnings": False,
+        "js_runtimes": {"deno": {}, "node": {}},
+    }
+    ffmpeg = resolve_tool("ffmpeg")
+    if ffmpeg:
+        ydl_opts["ffmpeg_location"] = str(Path(ffmpeg).parent)
+    if _is_audio_only(opts):
+        ydl_opts["postprocessors"] = [
             {
                 "key": "FFmpegExtractAudio",
                 "preferredcodec": opts.audio_format if opts.audio_format != "best" else "m4a",
                 "preferredquality": "192",
             }
         ]
-        ydl_opts: dict[str, Any] = {
-            "format": fmt,
-            "outtmpl": outtmpl,
-            "noplaylist": True,
-            "progress_hooks": [hook],
-            "postprocessors": postprocessors,
-            "quiet": True,
-            "no_warnings": False,
-            "js_runtimes": {"deno": {}, "node": {}},
-        }
     else:
-        ydl_opts = {
-            "format": fmt,
-            "outtmpl": outtmpl,
-            "noplaylist": True,
-            "merge_output_format": merge_format,
-            "progress_hooks": [hook],
-            "quiet": True,
-            "no_warnings": False,
-            "js_runtimes": {"deno": {}, "node": {}},
-        }
+        ydl_opts["merge_output_format"] = container
+        sort = format_sort_for(opts)
+        if sort:
+            ydl_opts["format_sort"] = sort
 
     log(f"格式选择器：{fmt}")
+    if (
+        not _is_audio_only(opts)
+        and container == "mp4"
+        and opts.audio_format not in ("m4a", "best", "")
+    ):
+        log("视频格式为 mp4，优先合并 aac/m4a 音轨，这样可以直接封装并保留声音。")
     log(f"保存目录：{opts.output_dir}")
     cookie_bits: list[str] = []
     if opts.cookiesfrombrowser:
@@ -567,6 +820,8 @@ def download(
     if cancel_event and cancel_event.is_set():
         raise RuntimeError("已取消")
 
+    attempts = build_extract_attempts(opts.url, opts.cookiefile, opts.cookiesfrombrowser)
+
     def on_success(ydl: Any, info: dict[str, Any]) -> DownloadResult:
         filepath: Optional[str] = None
         if "entries" in info and info["entries"]:
@@ -574,14 +829,13 @@ def download(
         try:
             filepath = ydl.prepare_filename(info)
             # 音频提取后扩展名可能变化
-            if opts.audio_only or opts.resolution == "audio":
+            if _is_audio_only(opts):
                 pref = opts.audio_format if opts.audio_format != "best" else "m4a"
                 filepath = str(Path(filepath).with_suffix(f".{pref}"))
-            # merge_output_format 也可能改扩展名
-            elif opts.video_format in ("mp4", "webm", "mkv"):
+            elif container in ("mp4", "webm", "mkv"):
                 p = Path(filepath)
-                if p.suffix.lower().lstrip(".") != opts.video_format:
-                    candidate = p.with_suffix(f".{merge_format}")
+                if p.suffix.lower().lstrip(".") != container:
+                    candidate = p.with_suffix(f".{container}")
                     if candidate.is_file():
                         filepath = str(candidate)
         except Exception:
@@ -599,17 +853,65 @@ def download(
                         break
 
         title = (info or {}).get("title", "") or ""
-        log(f"全部完成：{title}")
-        if on_progress:
-            on_progress(100.0, f"全部完成：{title}", filepath)
-        return DownloadResult(title=title, filepath=filepath, output_dir=opts.output_dir)
+        video_id = str((info or {}).get("id") or "")
+        return DownloadResult(
+            title=title,
+            filepath=filepath,
+            output_dir=opts.output_dir,
+            video_id=video_id,
+        )
 
-    return _extract_with_retries(
-        opts.url,
-        ydl_opts,
-        build_extract_attempts(opts.url, opts.cookiefile, opts.cookiesfrombrowser),
-        log,
-        download=True,
-        cancel_event=cancel_event,
-        on_success=on_success,
+    def run(format_spec: str, *, overwrite: bool) -> DownloadResult:
+        ydl_opts["format"] = format_spec
+        if overwrite:
+            ydl_opts["overwrites"] = True
+        return _extract_with_retries(
+            opts.url,
+            ydl_opts,
+            attempts,
+            log,
+            download=True,
+            cancel_event=cancel_event,
+            on_success=on_success,
+        )
+
+    def finish(result: DownloadResult) -> DownloadResult:
+        log(f"全部完成：{result.title}")
+        if on_progress:
+            on_progress(100.0, f"全部完成：{result.title}", result.filepath)
+        return result
+
+    result = run(fmt, overwrite=False)
+    if _is_audio_only(opts):
+        return finish(result)
+
+    chosen, has_audio = select_downloaded_file(
+        out_dir, result.filepath, result.video_id, container
     )
+    if chosen is not None:
+        result.filepath = str(chosen)
+    if has_audio is True and chosen is not None:
+        drop_silent_siblings(out_dir, result.filepath, result.video_id, chosen, log)
+    if has_audio is not False:
+        if has_audio is None and resolve_tool("ffprobe") is None:
+            log("未找到 ffprobe，无法确认音轨。")
+        return finish(result)
+
+    silent = _candidate_files(out_dir, result.filepath, result.video_id)
+    log("下载的文件没有音轨，正在改用包含音频的格式重新下载…")
+    _delete_files(silent, log)
+    retry_fmt = build_audio_retry_selector(opts)
+    log(f"重试格式选择器：{retry_fmt}")
+    result = run(retry_fmt, overwrite=True)
+    chosen, has_audio = select_downloaded_file(
+        out_dir, result.filepath, result.video_id, container
+    )
+    if chosen is not None:
+        result.filepath = str(chosen)
+    if has_audio is True and chosen is not None:
+        drop_silent_siblings(out_dir, result.filepath, result.video_id, chosen, log)
+    # 确认没音轨，或重试后根本没有文件：失败。ffprobe 自己没跑成则不误伤。
+    if has_audio is False or chosen is None:
+        _delete_files(_candidate_files(out_dir, result.filepath, result.video_id), log)
+        raise RuntimeError(NO_AUDIO_TRACK)
+    return finish(result)

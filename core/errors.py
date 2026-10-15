@@ -45,6 +45,30 @@ YOUTUBE_COOKIES_NEEDED = (
     "年龄限制或部分地区限制的视频可能仍需要 Cookie："
     "可在界面选择浏览器 Cookie，或填写 Netscape 格式的 Cookie 文件后再试。"
 )
+# 下载结果没有音轨。默认任务必须带声音，不能当成成功。
+NO_AUDIO_TRACK = (
+    "下载完成但文件没有音轨（只有画面）。"
+    "默认下载必须带声音。已自动改用带音频的格式重试，仍然没有音轨。"
+    "请换清晰度，或把音频格式设为 m4a 后再试。"
+)
+# 格式选择阶段就没有可合并的声音，不能退回只有画面的文件。
+FORMAT_NEEDS_AUDIO = (
+    "没有找到包含音轨的可用格式，已停止下载（不会保存只有画面的文件）。"
+    "请换清晰度，或把音频格式设为 m4a 后再试。"
+)
+FFMPEG_REQUIRED = (
+    "需要 ffmpeg 才能把画面和声音合并。"
+    "请确认程序目录里的 ffmpeg 可用后重试。"
+)
+
+_FORMAT_UNAVAILABLE_RE = re.compile(
+    r"requested format is not available|no video formats found|no audio formats found",
+    re.IGNORECASE,
+)
+_FFMPEG_MISSING_RE = re.compile(
+    r"ffmpeg is not installed|ffmpeg.{0,40}not found|merging of multiple formats but ffmpeg",
+    re.IGNORECASE,
+)
 
 
 def _iter_exceptions(exc: BaseException):
@@ -119,6 +143,15 @@ def is_cookie_load_failure(exc: BaseException) -> bool:
     return _COOKIE_FAIL_RE.search(blob) is not None
 
 
+def is_format_unavailable(exc: BaseException) -> bool:
+    """yt-dlp 没有选出符合格式串的流。默认下载把这当成「没有可合并的音轨」。"""
+    return _FORMAT_UNAVAILABLE_RE.search(_exception_blob(exc)) is not None
+
+
+def is_ffmpeg_missing(exc: BaseException) -> bool:
+    return _FFMPEG_MISSING_RE.search(_exception_blob(exc)) is not None
+
+
 def is_youtube_client_retryable(exc: BaseException) -> bool:
     """
     YouTube 换下一个 player client 还有意义的失败：
@@ -175,8 +208,14 @@ def friendly_error(exc: BaseException) -> str:
     if isinstance(exc, str):
         exc = RuntimeError(exc)
     blob = _exception_blob(exc)
+    if NO_AUDIO_TRACK in blob:
+        return NO_AUDIO_TRACK
+    if FORMAT_NEEDS_AUDIO in blob:
+        return FORMAT_NEEDS_AUDIO
     if YOUTUBE_COOKIES_NEEDED in blob:
         return YOUTUBE_COOKIES_NEEDED
+    if is_ffmpeg_missing(exc):
+        return FFMPEG_REQUIRED
     code = missing_media_code(exc)
     if code in (404, 410):
         return _GONE_MESSAGE.format(code=code)
