@@ -7,6 +7,7 @@ import threading
 from typing import Callable, Optional
 
 from core.downloader import DownloadOptions, download
+from core.errors import friendly_error
 from core.task_model import DownloadTask, TaskStatus
 
 # UI 侧在主线程用 after() 消费；队列回调本身在工作线程触发
@@ -97,6 +98,7 @@ class DownloadQueue:
         return True
 
     def cancel(self, task_id: str) -> None:
+        emit_task: Optional[DownloadTask] = None
         with self._lock:
             ev = self._cancel_events.get(task_id)
             task = self._tasks.get(task_id)
@@ -104,7 +106,9 @@ class DownloadQueue:
                 ev.set()
             if task and task.status == TaskStatus.QUEUED:
                 task.status = TaskStatus.CANCELLED
-                self._emit(task)
+                emit_task = task
+        if emit_task is not None:
+            self._emit(emit_task)
 
     def set_max_workers(self, n: int) -> None:
         with self._cv:
@@ -122,12 +126,13 @@ class DownloadQueue:
         while True:
             task: Optional[DownloadTask] = None
             cancel_ev: Optional[threading.Event] = None
+            to_emit: Optional[DownloadTask] = None
+            start_worker = False
             with self._cv:
                 while not self._stopped:
                     if self._active >= self.max_workers:
                         self._cv.wait(timeout=0.5)
                         continue
-                    # 找下一个 QUEUED
                     next_id = None
                     for tid in self._order:
                         t = self._tasks.get(tid)
@@ -140,26 +145,31 @@ class DownloadQueue:
                             break
                         continue
                     task = self._tasks[next_id]
-                    cancel_ev = self._cancel_events[next_id]
-                    if cancel_ev.is_set():
+                    cancel_ev = self._cancel_events.get(next_id)
+                    if cancel_ev is None or cancel_ev.is_set():
                         task.status = TaskStatus.CANCELLED
-                        self._emit(task)
-                        continue
+                        to_emit = task
+                        task = None
+                        cancel_ev = None
+                        break
                     task.status = TaskStatus.DOWNLOADING
                     self._active += 1
-                    self._emit(task)
+                    to_emit = task
+                    start_worker = True
                     break
-                if self._stopped:
+                if self._stopped and not start_worker and to_emit is None:
                     return
-
-            assert task is not None and cancel_ev is not None
-            t = threading.Thread(
+            # 锁外回调。回调里会 after() 到 Tk；持锁调用会和主线程 tasks() 交叉死锁。
+            if to_emit is not None:
+                self._emit(to_emit)
+            if not start_worker or task is None or cancel_ev is None:
+                continue
+            threading.Thread(
                 target=self._run_one,
                 args=(task.id, cancel_ev),
                 name=f"dl-{task.id}",
                 daemon=True,
-            )
-            t.start()
+            ).start()
 
     def _run_one(self, task_id: str, cancel_ev: threading.Event) -> None:
         with self._lock:
@@ -171,7 +181,11 @@ class DownloadQueue:
             return
 
         def log(msg: str) -> None:
-            self.on_log(f"[{task.display_name()}] {msg}")
+            try:
+                self.on_log(f"[{task.display_name()}] {msg}")
+            except Exception:
+                # 日志走 Tk after()。界面回调失败不能把下载线程打成任务失败。
+                pass
 
         def on_progress(pct: float, msg: str, filepath: Optional[str]) -> None:
             with self._lock:
@@ -194,6 +208,8 @@ class DownloadQueue:
                 video_format=task.video_format,
                 audio_format=task.audio_format,
                 audio_only=task.audio_only,
+                cookiefile=task.cookiefile,
+                cookiesfrombrowser=task.cookiesfrombrowser,
             )
             result = download(
                 opts,
@@ -222,16 +238,27 @@ class DownloadQueue:
                 )
         except Exception as e:
             msg = str(e)
-            cancelled = cancel_ev.is_set() or "取消" in msg
+            reason = friendly_error(e)
+            cancelled = cancel_ev.is_set() or "已取消" in msg or reason == "已取消"
             with self._lock:
                 t = self._tasks.get(task_id)
                 if not t:
                     return
-                t.status = TaskStatus.CANCELLED if cancelled else TaskStatus.FAILED
-                t.error = msg
+                if cancelled:
+                    t.status = TaskStatus.CANCELLED
+                    t.error = "已取消"
+                else:
+                    t.status = TaskStatus.FAILED
+                    t.error = reason
                 snap = t
             self._emit(snap)
-            log(f"{'已取消' if cancelled else '失败'}：{msg}")
+            try:
+                if cancelled:
+                    self.on_log(f"已取消 {task.url}")
+                else:
+                    self.on_log(f"任务失败 url={task.url} 原因：{reason}")
+            except Exception:
+                pass
         finally:
             with self._cv:
                 self._active = max(0, self._active - 1)

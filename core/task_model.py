@@ -46,6 +46,8 @@ class DownloadTask:
     audio_format: str = "m4a"
     audio_only: bool = False
     want_separate: bool = False
+    cookiefile: str = ""
+    cookiesfrombrowser: str = ""
 
     def status_label(self) -> str:
         return STATUS_LABELS_ZH.get(self.status, str(self.status))

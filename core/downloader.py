@@ -5,9 +5,12 @@ from __future__ import annotations
 
 import re
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
+
+from core.errors import friendly_error
 
 
 ProgressCallback = Callable[[str], None]
@@ -23,6 +26,8 @@ class DownloadOptions:
     video_format: str = "mp4"  # mp4 / webm / mkv / best
     audio_format: str = "m4a"  # m4a / mp3 / opus / best
     audio_only: bool = False
+    cookiefile: str = ""  # Netscape cookies.txt；空则不用
+    cookiesfrombrowser: str = ""  # "" | chrome | edge | firefox
 
 
 @dataclass
@@ -92,7 +97,67 @@ def build_format_selector(opts: DownloadOptions) -> str:
     return f"{video}+{audio}/b{height_filter}/best"
 
 
-def list_formats(url: str, log: Optional[ProgressCallback] = None) -> ProbeResult:
+_BROWSER_ALIASES = {
+    "": "",
+    "none": "",
+    "off": "",
+    "不使用": "",
+    "无": "",
+    "chrome": "chrome",
+    "edge": "edge",
+    "msedge": "edge",
+    "firefox": "firefox",
+}
+
+
+def normalize_browser(name: str) -> str:
+    """空 / 不使用 → ''；chrome、edge、firefox 原样。其它值报错。"""
+    key = (name or "").strip().lower()
+    if key in _BROWSER_ALIASES:
+        return _BROWSER_ALIASES[key]
+    raise RuntimeError(
+        f"不支持的浏览器 Cookie：{name}（可选 chrome / edge / firefox，或留空）"
+    )
+
+
+def apply_cookie_options(
+    ydl_opts: dict[str, Any],
+    cookiefile: str = "",
+    cookiesfrombrowser: str = "",
+) -> dict[str, Any]:
+    """
+    把可选 Cookie 写进 yt-dlp 参数。
+    未设置时不添加 cookiefile / cookiesfrombrowser，行为与原来一致。
+    """
+    browser = normalize_browser(cookiesfrombrowser)
+    path = (cookiefile or "").strip().strip('"').strip("'")
+    if path:
+        if not Path(path).is_file():
+            raise RuntimeError(f"Cookie 文件不存在：{path}")
+        ydl_opts["cookiefile"] = path
+    if browser:
+        # (browser, profile, keyring, container)，与 yt-dlp parse_options 一致
+        ydl_opts["cookiesfrombrowser"] = (browser, None, None, None)
+    return ydl_opts
+
+
+def _reraise_extract_error(exc: BaseException) -> None:
+    if isinstance(exc, RuntimeError) and (
+        str(exc).startswith("Cookie 文件不存在") or str(exc).startswith("不支持的浏览器")
+    ):
+        raise exc
+    if "已取消" in str(exc):
+        raise exc
+    raise RuntimeError(friendly_error(exc)) from exc
+
+
+def list_formats(
+    url: str,
+    log: Optional[ProgressCallback] = None,
+    *,
+    cookiefile: str = "",
+    cookiesfrombrowser: str = "",
+) -> ProbeResult:
     """探测可用格式（不下载）。"""
     yt_dlp = _import_yt_dlp()
     log = log or (lambda _m: None)
@@ -103,10 +168,15 @@ def list_formats(url: str, log: Optional[ProgressCallback] = None) -> ProbeResul
         "skip_download": True,
         "noplaylist": True,
     }
+    apply_cookie_options(ydl_opts, cookiefile, cookiesfrombrowser)
 
     log(f"正在探测格式：{url}")
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=False)
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception as e:
+        _reraise_extract_error(e)
+        raise  # pragma: no cover — _reraise_extract_error 总是抛出
 
     if info is None:
         raise RuntimeError("无法获取视频信息")
@@ -162,6 +232,8 @@ class _ProgressHook:
         self.on_progress = on_progress
         self.cancel_event = cancel_event
         self.last_filepath: Optional[str] = None
+        self._last_ui = 0.0
+        self._last_pct = -1.0
 
     def __call__(self, d: dict[str, Any]) -> None:
         if self.cancel_event and self.cancel_event.is_set():
@@ -174,6 +246,17 @@ class _ProgressHook:
 
         if status == "downloading":
             pct = _parse_percent(d)
+            now = time.monotonic()
+            # yt-dlp 进度可能一秒几十次。每条都 after() 到主线程会把窗口打成「未响应」。
+            if (
+                self._last_pct >= 0
+                and now - self._last_ui < 0.4
+                and abs(pct - self._last_pct) < 1.0
+                and pct < 100.0
+            ):
+                return
+            self._last_ui = now
+            self._last_pct = pct
             speed = (d.get("_speed_str") or "").strip()
             eta = (d.get("_eta_str") or "").strip()
             msg = f"下载中 {pct:.1f}%  速度 {speed}  剩余 {eta}"
@@ -192,6 +275,47 @@ class _ProgressHook:
                 self.on_progress(0.0, "下载出错", None)
 
 
+def ensure_output_dir(
+    path: str,
+    timeout: float = 20.0,
+    cancel_event: Optional[threading.Event] = None,
+) -> Path:
+    """
+    在调用线程之外创建保存目录。
+    必须由下载工作线程调用，不能在 Tk 主线程调用：未连接的盘符（如 F:）
+    上 mkdir 可能阻塞几十秒，主线程一阻塞窗口就会变成「未响应」。
+    """
+    path = (path or "").strip()
+    if not path:
+        raise RuntimeError("请选择保存路径。")
+
+    error: list[BaseException] = []
+    done = threading.Event()
+
+    def work() -> None:
+        try:
+            Path(path).mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            error.append(e)
+        finally:
+            done.set()
+
+    threading.Thread(target=work, name="mkdir-out", daemon=True).start()
+    deadline = time.monotonic() + max(0.1, timeout)
+    while not done.wait(0.2):
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError("已取消")
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"保存目录无响应：{path}。请确认磁盘已连接（例如 F: 盘）。"
+                "任务已失败，窗口不会因此卡住。"
+            )
+    if error:
+        detail = getattr(error[0], "strerror", None) or error[0]
+        raise RuntimeError(f"无法创建保存目录：{path}（{detail}）") from error[0]
+    return Path(path)
+
+
 def download(
     opts: DownloadOptions,
     log: Optional[ProgressCallback] = None,
@@ -200,13 +324,15 @@ def download(
 ) -> DownloadResult:
     """
     执行下载。返回 DownloadResult（含最终文件路径，若可解析）。
+    保存目录在本函数（工作线程）里创建，失败只影响这一条任务。
     """
-    yt_dlp = _import_yt_dlp()
     log = log or (lambda _m: None)
+    log(f"准备保存目录：{opts.output_dir}")
+    out_dir = ensure_output_dir(opts.output_dir, cancel_event=cancel_event)
+
+    yt_dlp = _import_yt_dlp()
     fmt = build_format_selector(opts)
 
-    out_dir = Path(opts.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
     outtmpl = str(out_dir / "%(title)s [%(id)s].%(ext)s")
 
     merge_format = opts.video_format if opts.video_format in ("mp4", "webm", "mkv") else "mp4"
@@ -240,14 +366,28 @@ def download(
             "no_warnings": False,
         }
 
+    apply_cookie_options(ydl_opts, opts.cookiefile, opts.cookiesfrombrowser)
+
     log(f"格式选择器：{fmt}")
     log(f"保存目录：{opts.output_dir}")
+    cookie_bits: list[str] = []
+    if opts.cookiesfrombrowser:
+        cookie_bits.append(f"浏览器 {normalize_browser(opts.cookiesfrombrowser)}")
+    if opts.cookiefile:
+        cookie_bits.append("Cookie 文件")
+    if cookie_bits:
+        log("已启用 " + "、".join(cookie_bits))
 
     if cancel_event and cancel_event.is_set():
         raise RuntimeError("已取消")
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(opts.url, download=True)
+        try:
+            info = ydl.extract_info(opts.url, download=True)
+        except Exception as e:
+            if cancel_event and cancel_event.is_set():
+                raise
+            _reraise_extract_error(e)
         if cancel_event and cancel_event.is_set():
             raise RuntimeError("已取消")
 
