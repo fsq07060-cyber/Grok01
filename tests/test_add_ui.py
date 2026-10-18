@@ -23,7 +23,7 @@ class AddTaskUiTests(unittest.TestCase):
             raise OSError(2, "The system cannot find the path specified")
 
         app = App()
-        self.assertIn("v1.3.2", app.title())
+        self.assertIn("v1.3.3", app.title())
         self.assertEqual(app.var_browser.get(), "不使用")
         texts: list[str] = []
 

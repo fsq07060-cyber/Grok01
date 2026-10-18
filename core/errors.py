@@ -69,7 +69,7 @@ IMPERSONATE_STILL_BLOCKED = (
 # 包里没有 curl_cffi 时，yt-dlp 会要求用户自己 pip install。安装包必须带上这个组件。
 IMPERSONATE_DEPENDENCY_MISSING = (
     "浏览器指纹组件没有打进当前程序，Cloudflare 站点无法自动重试。"
-    "请换用 v1.3.2 或更新的 Windows 压缩包，解压覆盖后重新打开。"
+    "请换用 v1.3.3 或更新的 Windows 压缩包，解压覆盖后重新打开。"
     "不需要再单独执行 pip install。"
 )
 # 界面上的固定说明，和失败文案同一口径。

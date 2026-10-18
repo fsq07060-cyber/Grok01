@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 import threading
@@ -108,6 +109,60 @@ def _resolution_height(res: str) -> Optional[int]:
     return int(m.group(1)) if m else None
 
 
+_DIM_RE = re.compile(r"(?P<w>\d{3,4})x(?P<h>\d{3,4})", re.IGNORECASE)
+_HEIGHT_P_RE = re.compile(r"(?<!\d)(?P<h>\d{3,4})p(?!\d)", re.IGNORECASE)
+
+
+def _plausible_height(value: int) -> bool:
+    return 144 <= value <= 4320
+
+
+def _height_hint(fmt: dict[str, Any]) -> Optional[int]:
+    """从路径或格式说明里读 1080p / 1920x1080。不看 query，避免把签名里的数字当成清晰度。"""
+    url = str(fmt.get("url") or "")
+    path = urlparse(url).path if url else ""
+    texts = [
+        path,
+        str(fmt.get("format_id") or ""),
+        str(fmt.get("format") or ""),
+        str(fmt.get("format_note") or ""),
+        str(fmt.get("resolution") or ""),
+    ]
+    found: Optional[int] = None
+    for text in texts:
+        for match in _DIM_RE.finditer(text):
+            height = int(match.group("h"))
+            if _plausible_height(height):
+                found = height
+        for match in _HEIGHT_P_RE.finditer(text):
+            height = int(match.group("h"))
+            if _plausible_height(height):
+                found = height
+    return found
+
+
+def fill_missing_stream_hints(info: dict[str, Any]) -> None:
+    """
+    通用提取经常只给出 mp4 地址，不写 height / 编码。
+    补上路径里的清晰度，后面的 height 过滤和排序才能选对 1080p 而不是另一条。
+    不臆造 acodec：没写编码的合体流交给格式串的 `?`，纯画面仍是字面 none。
+    """
+    if not isinstance(info, dict):
+        return
+    formats = info.get("formats")
+    targets: list[dict[str, Any]] = []
+    if isinstance(formats, list):
+        targets.extend(item for item in formats if isinstance(item, dict))
+    elif info.get("url"):
+        targets.append(info)
+    for fmt in targets:
+        if fmt.get("height"):
+            continue
+        height = _height_hint(fmt)
+        if height:
+            fmt["height"] = height
+
+
 def _merge_container(video_format: str) -> str:
     if video_format in ("mp4", "webm", "mkv"):
         return video_format
@@ -172,12 +227,23 @@ def _video_terms(container: str, video_format: str, height_filter: str) -> list[
     return _dedupe(terms)
 
 
+def _muxed_fallbacks(height_filter: str) -> list[str]:
+    """
+    没有独立音轨可合并时，接受一条已经含画面的单文件。
+    `?` 让「提取器没写 vcodec/acodec」的合体流通过（通用提取常见）。
+    字面量 acodec=none / vcodec=none 的纯画面或纯声音仍然排除，避免无声 AV1 抢先。
+    """
+    terms: list[str] = []
+    if height_filter:
+        terms.append(f"b{height_filter}[vcodec!=?none][acodec!=?none]")
+    terms.append("b[vcodec!=?none][acodec!=?none]")
+    return terms
+
+
 def _with_audio_fallbacks(videos: list[str], audios: list[str], height_filter: str) -> str:
     """每个 `/` 分支都是「画面+声音」或自带音轨的单文件。`+` 比 `/` 更紧，不能把 bv* 单独放在斜线左边。"""
     parts = [f"{video}+{audio}" for video in videos for audio in audios]
-    if height_filter:
-        parts.append(f"b{height_filter}[vcodec!=none][acodec!=none]")
-    parts.append("b[vcodec!=none][acodec!=none]")
+    parts.extend(_muxed_fallbacks(height_filter))
     return "/".join(parts)
 
 
@@ -199,7 +265,7 @@ def build_format_selector(opts: DownloadOptions) -> str:
 
 
 def build_audio_retry_selector(opts: DownloadOptions) -> str:
-    """第一次下到无声文件时用的更宽格式：不限容器，仍然必须有音轨。"""
+    """第一次下到无声文件时用的更宽格式：不限容器。纯画面仍不选，未声明编码的合体流可以。"""
     container = _merge_container(opts.video_format)
     height_filter = _height_filter(opts.resolution)
     videos = [f"bv*{height_filter}"] if height_filter else []
@@ -467,7 +533,13 @@ def _extract_with_retries(
             log(_attempt_log(attempt, index, client_total))
         try:
             opts = _opts_for_attempt(base_opts, attempt)
-            with yt_dlp.YoutubeDL(opts) as ydl:
+
+            class _HintYDL(yt_dlp.YoutubeDL):
+                def process_video_result(self, info_dict, download=True):  # type: ignore[override]
+                    fill_missing_stream_hints(info_dict)
+                    return super().process_video_result(info_dict, download=download)
+
+            with _HintYDL(opts) as ydl:
                 info = ydl.extract_info(url, download=download)
                 if info is None:
                     raise RuntimeError("无法获取视频信息")
@@ -695,12 +767,61 @@ _MEDIA_SUFFIXES = {
     ".m4v",
 }
 _INTERMEDIATE_RE = re.compile(r"\.f\d+\.")
+# codec_type 不是 audio、但编码名或标签能认出来的声音。
+_AUDIO_NAME_RE = re.compile(
+    r"aac|mp3|mp2|mp4a|opus|vorbis|flac|alac|ac-?3|eac3|dts|truehd|amr|speex|"
+    r"wmav|wmapro|cook|sipr|qcelp|gsm|nelly|tta|wavpack|\bape\b|mlp|atrac|"
+    r"adpcm|pcm_|pcm\b",
+    re.IGNORECASE,
+)
+_CLEAR_NON_AUDIO = {"video", "subtitle", "attachment"}
+
+
+def probe_streams_have_audio(streams: list[dict[str, Any]]) -> Optional[bool]:
+    """
+    True：有音轨（含编码名不标准、但能认出是声音的流）。
+    False：只有画面等明确的非音轨，是真·纯画面。
+    None：没探到流，或还有 data/unknown，不能据此删文件。
+    """
+    if not streams:
+        return None
+    saw_video = False
+    ambiguous = False
+    for stream in streams:
+        if _stream_is_audio(stream):
+            return True
+        kind = str(stream.get("codec_type") or "").strip().lower()
+        if kind == "video":
+            saw_video = True
+        elif kind not in _CLEAR_NON_AUDIO:
+            ambiguous = True
+    if ambiguous or not saw_video:
+        return None
+    return False
+
+
+def _stream_is_audio(stream: dict[str, Any]) -> bool:
+    kind = str(stream.get("codec_type") or "").strip().lower()
+    if kind == "audio":
+        return True
+    label = " ".join(
+        str(stream.get(key) or "")
+        for key in ("codec_name", "codec_tag_string", "codec_long_name")
+    )
+    if _AUDIO_NAME_RE.search(label):
+        return True
+    if kind in _CLEAR_NON_AUDIO:
+        return False
+    if stream.get("channels") or stream.get("channel_layout") or stream.get("sample_rate"):
+        return True
+    return False
 
 
 def file_has_audio(path: Optional[str]) -> Optional[bool]:
     """
     ffprobe 是否看到音轨。
-    True/False 表示已经确认；None 表示文件不存在或 ffprobe 没跑成，不能据此判失败。
+    True/False 表示已经确认；None 表示文件不存在、ffprobe 没跑成，或流类型含糊，不能据此判失败。
+    只有确认是纯画面才返回 False。
     """
     if not path:
         return None
@@ -716,12 +837,14 @@ def file_has_audio(path: Optional[str]) -> Optional[bool]:
                 probe,
                 "-v",
                 "error",
-                "-select_streams",
-                "a",
+                "-probesize",
+                "32000000",
+                "-analyzeduration",
+                "10000000",
                 "-show_entries",
-                "stream=codec_type",
+                "stream=codec_type,codec_name,codec_tag_string,codec_long_name,channels,channel_layout,sample_rate",
                 "-of",
-                "csv=p=0",
+                "json",
                 str(file_path),
             ],
             capture_output=True,
@@ -730,9 +853,24 @@ def file_has_audio(path: Optional[str]) -> Optional[bool]:
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
-    if proc.returncode != 0:
+    payload = _parse_probe_json(proc.stdout)
+    if payload is None:
         return None
-    return "audio" in (proc.stdout or "").lower()
+    streams = payload.get("streams")
+    if not isinstance(streams, list):
+        return None
+    return probe_streams_have_audio([item for item in streams if isinstance(item, dict)])
+
+
+def _parse_probe_json(text: str) -> Optional[dict[str, Any]]:
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    return data if isinstance(data, dict) else None
 
 
 def _candidate_files(out_dir: Path, filepath: Optional[str], video_id: str) -> list[Path]:

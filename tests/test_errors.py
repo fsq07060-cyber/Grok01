@@ -207,8 +207,8 @@ class CookieOptionTests(unittest.TestCase):
             if branch.startswith("bv"):
                 self.assertIn("+", branch, branch)
             else:
-                self.assertIn("acodec!=none", branch)
-                self.assertIn("vcodec!=none", branch)
+                self.assertIn("acodec!=?none", branch)
+                self.assertIn("vcodec!=?none", branch)
 
 
 class QueueFailureLogTests(unittest.TestCase):
