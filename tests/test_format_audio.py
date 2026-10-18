@@ -15,7 +15,9 @@ from core.downloader import (
     build_format_selector,
     download,
     file_has_audio,
+    fill_missing_stream_hints,
     format_sort_for,
+    probe_streams_have_audio,
     select_downloaded_file,
 )
 from core.errors import FFMPEG_REQUIRED, FORMAT_NEEDS_AUDIO, NO_AUDIO_TRACK, friendly_error
@@ -143,10 +145,119 @@ class FormatSelectorTests(unittest.TestCase):
             if branch.startswith("bv"):
                 self.assertIn("+", branch)
             else:
-                self.assertIn("acodec!=none", branch)
+                self.assertIn("acodec!=?none", branch)
+
+    def test_unlabeled_muxed_mp4_is_accepted_and_height_is_honored(self) -> None:
+        # 通用提取：三条合体 mp4，vcodec/acodec 都是空，地址里带 480p/720p/1080p。
+        formats = [
+            _fmt(format_id="0", ext="mp4", url="https://cdn.example/408579-720p.mp4?secure=1", vcodec=None, acodec=None),
+            _fmt(format_id="1", ext="mp4", url="https://cdn.example/408579-480p.mp4?secure=1", vcodec=None, acodec=None),
+            _fmt(format_id="2", ext="mp4", url="https://cdn.example/408579-1080p.mp4?secure=1", vcodec=None, acodec=None),
+        ]
+        info = {"formats": [dict(item) for item in formats]}
+        fill_missing_stream_hints(info)
+        heights = {item["format_id"]: item.get("height") for item in info["formats"]}
+        self.assertEqual(heights, {"0": 720, "1": 480, "2": 1080})
+
+        default = DownloadOptions(url="https://hanime1.me/watch?v=408579", output_dir=".")
+        spec = build_format_selector(default)
+        self.assertIn("acodec!=?none", spec)
+        for branch in spec.split("/"):
+            if branch.startswith("bv"):
+                self.assertIn("+", branch)
+        self.assertEqual(_ids(_pick(default, info["formats"])), "2")
+
+        low = DownloadOptions(url=default.url, output_dir=".", resolution="720", audio_format="best")
+        self.assertEqual(_ids(_pick(low, info["formats"])), "0")
+
+        best = DownloadOptions(url=default.url, output_dir=".", resolution="best", audio_format="best")
+        self.assertEqual(_ids(_pick(best, info["formats"])), "2")
+
+    def test_labeled_muxed_aac_is_used_when_it_is_the_only_stream(self) -> None:
+        formats = [
+            _fmt(
+                format_id="hls",
+                ext="mp4",
+                vcodec="h264",
+                acodec="aac",
+                height=1080,
+                width=1920,
+                tbr=4000,
+            )
+        ]
+        opts = DownloadOptions(url="https://example.com/watch", output_dir=".")
+        picked = _pick(opts, formats)
+        self.assertEqual(_ids(picked), "hls")
+        self.assertEqual(picked.get("acodec"), "aac")
+
+    def test_merge_still_beats_an_unlabeled_single_file(self) -> None:
+        formats = list(YOUTUBE_LIKE) + [
+            _fmt(
+                format_id="mux",
+                ext="mp4",
+                url="https://cdn.example/watch-1080p.mp4",
+                vcodec=None,
+                acodec=None,
+            )
+        ]
+        info = {"formats": [dict(item) for item in formats]}
+        fill_missing_stream_hints(info)
+        opts = DownloadOptions(url=YT, output_dir=".")
+        picked = _pick(opts, info["formats"], incomplete=True)
+        self.assertEqual(_ids(picked), "137+140")
+
+    def test_height_hint_does_not_overwrite_or_read_query(self) -> None:
+        info = {
+            "formats": [
+                {
+                    "format_id": "keep",
+                    "height": 360,
+                    "url": "https://cdn.example/1080p.mp4?secure=720p",
+                },
+                {
+                    "format_id": "query-only",
+                    "url": "https://cdn.example/file.mp4?secure=1080p",
+                },
+            ]
+        }
+        fill_missing_stream_hints(info)
+        self.assertEqual(info["formats"][0]["height"], 360)
+        self.assertNotIn("height", info["formats"][1])
 
 
 class ProbeAndRetryTests(unittest.TestCase):
+    def test_probe_accepts_nonstandard_audio_and_only_rejects_video_only(self) -> None:
+        self.assertTrue(
+            probe_streams_have_audio(
+                [
+                    {"codec_type": "video", "codec_name": "h264"},
+                    {"codec_type": "audio", "codec_name": "aac", "channels": 2},
+                ]
+            )
+        )
+        self.assertTrue(
+            probe_streams_have_audio(
+                [
+                    {"codec_type": "video", "codec_name": "h264"},
+                    {"codec_type": "data", "codec_tag_string": "mp4a", "codec_name": ""},
+                ]
+            )
+        )
+        self.assertFalse(
+            probe_streams_have_audio(
+                [{"codec_type": "video", "codec_name": "av1"}]
+            )
+        )
+        self.assertIsNone(probe_streams_have_audio([]))
+        self.assertIsNone(
+            probe_streams_have_audio(
+                [
+                    {"codec_type": "video", "codec_name": "h264"},
+                    {"codec_type": "data", "codec_name": "bin_data"},
+                ]
+            )
+        )
+
     def test_ffprobe_distinguishes_silent_video(self) -> None:
         ffmpeg = resolve_tool("ffmpeg")
         if not ffmpeg:
