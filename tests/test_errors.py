@@ -12,10 +12,14 @@ from unittest import mock
 
 from core.downloader import DownloadOptions, DownloadResult, apply_cookie_options, build_format_selector
 from core.errors import (
+    IMPERSONATE_DEPENDENCY_MISSING,
+    IMPERSONATE_STILL_BLOCKED,
+    SITE_LIMIT_TIP,
     YOUTUBE_COOKIES_NEEDED,
     ProbeBatchResult,
     format_probe_failure_dialog,
     friendly_error,
+    is_impersonate_retryable,
     is_youtube_client_retryable,
     run_probe_batch,
 )
@@ -86,6 +90,31 @@ class FriendlyErrorTests(unittest.TestCase):
         self.assertFalse(is_youtube_client_retryable(RuntimeError("HTTP Error 404: Not Found")))
         self.assertFalse(is_youtube_client_retryable(RuntimeError("已取消")))
         self.assertFalse(is_youtube_client_retryable(RuntimeError("不支持的浏览器 Cookie：safari")))
+
+    def test_cloudflare_403_is_impersonate_retryable_but_404_is_not(self) -> None:
+        cf = RuntimeError(
+            "ERROR: [generic] Got HTTP Error 403 caused by Cloudflare anti-bot challenge; "
+            "see https://github.com/yt-dlp/yt-dlp#impersonation for how to install the "
+            'required impersonation dependency, and try again with --extractor-args "generic:impersonate"'
+        )
+        self.assertTrue(is_impersonate_retryable(cf))
+        self.assertTrue(is_impersonate_retryable(RuntimeError("HTTP Error 403: Forbidden")))
+        self.assertFalse(is_impersonate_retryable(RuntimeError("HTTP Error 404: Not Found")))
+        self.assertFalse(is_impersonate_retryable(RuntimeError("HTTP Error 410: Gone")))
+        self.assertEqual(friendly_error(RuntimeError(IMPERSONATE_STILL_BLOCKED)), IMPERSONATE_STILL_BLOCKED)
+        missing = RuntimeError(
+            'Impersonate target "chrome" is not available. '
+            "You may be missing dependencies required to support this target."
+        )
+        self.assertEqual(friendly_error(missing), IMPERSONATE_DEPENDENCY_MISSING)
+
+    def test_site_limit_tip_is_honest(self) -> None:
+        self.assertIn("不能保证每个网站都能下载", SITE_LIMIT_TIP)
+        self.assertIn("年龄限制", SITE_LIMIT_TIP)
+        self.assertIn("DRM", SITE_LIMIT_TIP)
+        self.assertIn("Cloudflare", SITE_LIMIT_TIP)
+        self.assertIn("浏览器 Cookie", SITE_LIMIT_TIP)
+        self.assertNotIn("所有网站", SITE_LIMIT_TIP)
 
 
 class ProbeBatchTests(unittest.TestCase):

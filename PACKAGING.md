@@ -28,10 +28,11 @@
 **流水线步骤摘要：**
 
 1. checkout + setup Python 3.12  
-2. `pip install -r requirements.txt pyinstaller`  
+2. `pip install -r requirements.txt pyinstaller`（`yt-dlp[default,curl-cffi]`，浏览器指纹随包）  
 3. 从 [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds/releases) 下载 `ffmpeg-master-latest-win64-gpl.zip`，仅解出 `ffmpeg.exe` / `ffprobe.exe` 到 `ffmpeg/bin/`  
-4. `pyinstaller --noconfirm build_windows.spec`  
-5. 上传 artifact：`StreamDownloader-windows`（整个 `dist/StreamDownloader/`），**retention 14 天**
+4. `pyinstaller --noconfirm build_windows.spec`（`collect_all("curl_cffi")`，并把 `curl_cffi.libs` 里的 `libcurl-impersonate*.dll` 放到与 `curl_cffi` 同级）  
+5. 检查包内有 `_wrapper.pyd` 与 `libcurl-impersonate*.dll`；缺了就失败，避免用户看到「请 pip install impersonation」  
+6. 上传 artifact：`StreamDownloader-windows`（整个 `dist/StreamDownloader/`），**retention 14 天**
 
 **推仓并跑通（需你有 GitHub 仓库写权限）：**
 

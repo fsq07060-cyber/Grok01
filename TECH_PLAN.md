@@ -31,7 +31,7 @@
 | 包 | 用途 | 版本建议 |
 |----|------|----------|
 | `customtkinter` | 桌面 UI | >=5.2 |
-| `yt-dlp` | 下载与格式探测 | 最新稳定版 |
+| `yt-dlp[default,curl-cffi]` | 下载、格式探测、Cloudflare 浏览器指纹 | 2026.10 nightly + curl_cffi |
 | `demucs` | 人声/伴奏分离（v2） | >=4.0（可选安装） |
 | `torch` / `torchaudio` | Demucs 运行时（v2） | 按 CUDA/CPU 官方指引选轮子 |
 

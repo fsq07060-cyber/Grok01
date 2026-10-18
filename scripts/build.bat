@@ -12,7 +12,7 @@ if errorlevel 1 (
   exit /b 1
 )
 
-python -c "import customtkinter, yt_dlp" 2>nul
+python -c "import customtkinter, yt_dlp, curl_cffi" 2>nul
 if errorlevel 1 (
   echo [INFO] 安装依赖…
   pip install -r requirements.txt pyinstaller

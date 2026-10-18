@@ -32,6 +32,19 @@ _CLIENT_REJECT_RE = re.compile(
     r"drm[- ]protected|only images are available",
     re.IGNORECASE,
 )
+# Cloudflare 挑战，或 yt-dlp 提示改用 impersonate / 缺少指纹目标。
+_CF_OR_IMPERSONATE_RE = re.compile(
+    r"cloudflare|cf-mitigated|cf-chl|just a moment|attention required|"
+    r"anti-bot|impersonat|generic:impersonate",
+    re.IGNORECASE,
+)
+# 只有「目标不可用」才是缺依赖。generic 的 403 提示里也会带文档链接，那是要重试，不是缺包。
+_IMPERSONATE_MISSING_RE = re.compile(
+    r"impersonate target .{0,120} is not available|"
+    r"no impersonate target is available|"
+    r"none of these impersonate targets are available",
+    re.IGNORECASE,
+)
 
 _GONE_MESSAGE = "该视频已失效或已删除 (HTTP {code})"
 _COOKIE_MESSAGE = "无法读取 Cookie。请确认浏览器可用，或改用 Netscape 格式的 Cookie 文件。"
@@ -44,6 +57,27 @@ YOUTUBE_COOKIES_NEEDED = (
     "这个视频不用 Cookie 仍无法下载（YouTube 返回 403 或要求登录）。"
     "年龄限制或部分地区限制的视频可能仍需要 Cookie："
     "可在界面选择浏览器 Cookie，或填写 Netscape 格式的 Cookie 文件后再试。"
+)
+# 非 YouTube：403 / Cloudflare 已经用浏览器指纹重试过，仍然失败。
+# 不把 Cookie 当成默认步骤，也不说「所有网站都能下」。
+IMPERSONATE_STILL_BLOCKED = (
+    "这个链接不用 Cookie 仍无法下载（HTTP 403 或 Cloudflare 验证）。"
+    "程序已自动用浏览器指纹重试过一次。"
+    "年龄限制、较重的 Cloudflare 验证或 DRM 仍可能失败，不能保证每个网站都能下载。"
+    "若你有权观看，可以再选浏览器 Cookie，或填写 Netscape 格式的 Cookie 文件。"
+)
+# 包里没有 curl_cffi 时，yt-dlp 会要求用户自己 pip install。安装包必须带上这个组件。
+IMPERSONATE_DEPENDENCY_MISSING = (
+    "浏览器指纹组件没有打进当前程序，Cloudflare 站点无法自动重试。"
+    "请换用 v1.3.2 或更新的 Windows 压缩包，解压覆盖后重新打开。"
+    "不需要再单独执行 pip install。"
+)
+# 界面上的固定说明，和失败文案同一口径。
+SITE_LIMIT_TIP = (
+    "默认不读取浏览器 Cookie。"
+    "遇到 HTTP 403 或 Cloudflare 验证时，会先用浏览器指纹再试一次。"
+    "年龄限制、较重的 Cloudflare 验证或 DRM 仍可能失败，不能保证每个网站都能下载。"
+    "仍失败时，可以再选浏览器 Cookie，或填写 Netscape 格式的 Cookie 文件。"
 )
 # 下载结果没有音轨。默认任务必须带声音，不能当成成功。
 NO_AUDIO_TRACK = (
@@ -152,6 +186,32 @@ def is_ffmpeg_missing(exc: BaseException) -> bool:
     return _FFMPEG_MISSING_RE.search(_exception_blob(exc)) is not None
 
 
+def is_impersonate_dependency_missing(exc: BaseException) -> bool:
+    """curl_cffi 不在，或当前没有可用的 impersonate 目标。"""
+    return _IMPERSONATE_MISSING_RE.search(_exception_blob(exc)) is not None
+
+
+def is_impersonate_retryable(exc: BaseException) -> bool:
+    """
+    再用浏览器指纹试一次还有意义：HTTP 403、Cloudflare 验证、yt-dlp 要求 impersonate。
+    404/410、取消、不支持的浏览器名称不再重试。
+    """
+    if "已取消" in str(exc):
+        return False
+    if missing_media_code(exc) in (404, 410):
+        return False
+    blob = _exception_blob(exc)
+    if "不支持的浏览器" in blob:
+        return False
+    if is_impersonate_dependency_missing(exc):
+        return True
+    if _HTTP_403_RE.search(blob):
+        return True
+    if _CF_OR_IMPERSONATE_RE.search(blob):
+        return True
+    return False
+
+
 def is_youtube_client_retryable(exc: BaseException) -> bool:
     """
     YouTube 换下一个 player client 还有意义的失败：
@@ -214,6 +274,12 @@ def friendly_error(exc: BaseException) -> str:
         return FORMAT_NEEDS_AUDIO
     if YOUTUBE_COOKIES_NEEDED in blob:
         return YOUTUBE_COOKIES_NEEDED
+    if IMPERSONATE_STILL_BLOCKED in blob:
+        return IMPERSONATE_STILL_BLOCKED
+    if IMPERSONATE_DEPENDENCY_MISSING in blob:
+        return IMPERSONATE_DEPENDENCY_MISSING
+    if is_impersonate_dependency_missing(exc):
+        return IMPERSONATE_DEPENDENCY_MISSING
     if is_ffmpeg_missing(exc):
         return FFMPEG_REQUIRED
     code = missing_media_code(exc)

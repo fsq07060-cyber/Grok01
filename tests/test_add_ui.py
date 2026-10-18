@@ -23,6 +23,21 @@ class AddTaskUiTests(unittest.TestCase):
             raise OSError(2, "The system cannot find the path specified")
 
         app = App()
+        self.assertIn("v1.3.2", app.title())
+        self.assertEqual(app.var_browser.get(), "不使用")
+        texts: list[str] = []
+
+        def walk(widget) -> None:
+            try:
+                texts.append(str(widget.cget("text")))
+            except Exception:
+                pass
+            for child in widget.winfo_children():
+                walk(child)
+
+        walk(app)
+        self.assertTrue(any("不能保证每个网站都能下载" in item for item in texts))
+        self.assertTrue(any("Cloudflare" in item for item in texts))
         result: dict = {}
 
         def start() -> None:
