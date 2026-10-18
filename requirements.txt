@@ -3,7 +3,9 @@ customtkinter>=5.2.0
 # 2026-10 nightly：登录前默认客户端是 tv_samsung,visionos,web（不要求 PO Token）。
 # 稳定版 2026.8.19 还没有 tv_samsung。版本号里带 .dev0，pip 会安装这个预发布版。
 # [default] 带上 yt-dlp-ejs，本机有 Deno/Node 时才能解开 web 客户端的签名。
-yt-dlp[default]>=2026.10.10.233141.dev0
+# [curl-cffi] 带上浏览器指纹。版本范围由 yt-dlp 约束（0.10–0.16），不要另钉不兼容版本。
+# Windows 包必须打进 curl_cffi 和 libcurl-impersonate，用户不用再 pip install。
+yt-dlp[default,curl-cffi]>=2026.10.10.233141.dev0
 
 # v2 可选（人声/伴奏分离）；按需安装，勿与重型 CUDA 轮子强绑
 # demucs>=4.0.0

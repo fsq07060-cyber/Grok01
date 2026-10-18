@@ -15,7 +15,7 @@ import customtkinter as ctk
 from core import separator as sep
 from core.clipboard_watch import ClipboardWatcher
 from core.downloader import list_formats
-from core.errors import format_probe_failure_dialog, friendly_error, run_probe_batch
+from core.errors import SITE_LIMIT_TIP, format_probe_failure_dialog, friendly_error, run_probe_batch
 from core.platform_util import open_directory, open_file
 from core.task_model import DownloadTask, TaskStatus
 from core.task_queue import DownloadQueue
@@ -117,9 +117,9 @@ class TaskRow(ctk.CTkFrame):
 class App(ctk.CTk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("流媒体下载器 v1.3.1 · 人声/伴奏分离")
-        self.geometry("920x800")
-        self.minsize(760, 640)
+        self.title("流媒体下载器 v1.3.2 · 人声/伴奏分离")
+        self.geometry("920x860")
+        self.minsize(760, 700)
 
         ctk.set_appearance_mode("System")
         ctk.set_default_color_theme("blue")
@@ -267,7 +267,7 @@ class App(ctk.CTk):
         )
         ctk.CTkLabel(
             frm_ck,
-            text="默认不用 Cookie。YouTube 会自动换客户端；年龄限制或地区限制仍失败时，再选浏览器或 Netscape Cookie 文件。",
+            text=SITE_LIMIT_TIP,
             text_color="gray60",
             anchor="w",
             justify="left",
@@ -319,6 +319,7 @@ class App(ctk.CTk):
         self.log_box = ctk.CTkTextbox(self, height=120)
         self.log_box.grid(row=8, column=0, sticky="nsew", padx=12, pady=(4, 12))
         self._log("欢迎使用流媒体下载器。可一次粘贴多个链接后点击「添加任务」（每条单独入队，失败互不影响）。")
+        self._log(SITE_LIMIT_TIP)
         self._log("「探测全部链接」会逐条检查，失败的 URL 会写进日志；不会只测第一条。")
         self._log(self._demucs_msg)
         self._log(f"默认并发：{DEFAULT_CONCURRENCY}（可在上方调整）")

@@ -14,10 +14,14 @@ from urllib.parse import urlparse
 
 from core.errors import (
     FORMAT_NEEDS_AUDIO,
+    IMPERSONATE_DEPENDENCY_MISSING,
+    IMPERSONATE_STILL_BLOCKED,
     NO_AUDIO_TRACK,
     YOUTUBE_COOKIES_NEEDED,
     friendly_error,
     is_format_unavailable,
+    is_impersonate_dependency_missing,
+    is_impersonate_retryable,
     is_youtube_client_retryable,
     youtube_retry_reason,
 )
@@ -73,6 +77,28 @@ def _import_yt_dlp():
     except ImportError as e:
         raise RuntimeError("未安装 yt-dlp。请执行：pip install yt-dlp") from e
     return yt_dlp
+
+
+# 模块级导入让 PyInstaller 分析能跟上 curl_cffi._wrapper。
+# Windows 轮子里的 libcurl-impersonate 在 curl_cffi.libs，由 build_windows.spec 单独打进包。
+try:
+    import curl_cffi as _curl_cffi  # noqa: F401
+except Exception:
+    _curl_cffi = None
+
+
+def _impersonate_target():
+    """
+    --impersonate chrome。
+    版本留空时，yt-dlp 会选当前 curl_cffi 里优先的桌面 Chrome。
+    见 https://github.com/yt-dlp/yt-dlp#impersonation
+    """
+    try:
+        import curl_cffi  # noqa: F401
+        from yt_dlp.networking.impersonate import ImpersonateTarget
+    except Exception as exc:
+        raise RuntimeError(IMPERSONATE_DEPENDENCY_MISSING) from exc
+    return ImpersonateTarget(client="chrome")
 
 
 def _resolution_height(res: str) -> Optional[int]:
@@ -267,6 +293,7 @@ class _ExtractAttempt:
     cookiesfrombrowser: str
     player_clients: tuple[str, ...]
     label: str
+    impersonate: bool = False
 
 
 def build_extract_attempts(
@@ -275,15 +302,22 @@ def build_extract_attempts(
     cookiesfrombrowser: str = "",
 ) -> list[_ExtractAttempt]:
     """
-    非 YouTube：一次，沿用用户填写的 Cookie（可为空）。
-    YouTube：若用户填了 Cookie，先用 yt-dlp 的登录客户端；
-    然后在不带 Cookie 的情况下按推荐客户端重试。player_clients 为空表示不覆盖默认值。
-    """
-    if not is_youtube_url(url):
-        return [_ExtractAttempt(cookiefile or "", cookiesfrombrowser or "", (), "")]
+    非 YouTube：先按用户填写的 Cookie（默认空，不读浏览器）请求一次。
+    若遇到 403 / Cloudflare，同一套 Cookie 再开 --impersonate 与 generic:impersonate。
+    不会自动改成 chrome 的 cookiesfrombrowser。
 
+    YouTube：若用户填了 Cookie，先用 yt-dlp 的登录客户端；
+    然后在不带 Cookie 的情况下按推荐客户端重试。
+    客户端都因 403 / Cloudflare 失败时，最后再试一次浏览器指纹，仍然不自动读 Cookie。
+    player_clients 为空表示不覆盖默认值。
+    """
     path = (cookiefile or "").strip()
     browser = cookiesfrombrowser or ""
+    if not is_youtube_url(url):
+        plain = _ExtractAttempt(path, browser, (), "", False)
+        fingerprinted = _ExtractAttempt(path, browser, (), "浏览器指纹", True)
+        return [plain, fingerprinted]
+
     has_cookies = bool(path)
     if browser.strip():
         try:
@@ -294,14 +328,21 @@ def build_extract_attempts(
             has_cookies = True
 
     attempts: list[_ExtractAttempt] = []
-    seen: set[tuple[str, str, tuple[str, ...]]] = set()
+    seen: set[tuple[str, str, tuple[str, ...], bool]] = set()
 
-    def add(cookie: str, browser_name: str, clients: tuple[str, ...], label: str) -> None:
-        key = (cookie, browser_name, clients)
+    def add(
+        cookie: str,
+        browser_name: str,
+        clients: tuple[str, ...],
+        label: str,
+        *,
+        impersonate: bool = False,
+    ) -> None:
+        key = (cookie, browser_name, clients, impersonate)
         if key in seen:
             return
         seen.add(key)
-        attempts.append(_ExtractAttempt(cookie, browser_name, clients, label))
+        attempts.append(_ExtractAttempt(cookie, browser_name, clients, label, impersonate))
 
     if has_cookies:
         add(path, browser, (), "已填写的 Cookie")
@@ -316,6 +357,8 @@ def build_extract_attempts(
 
     if not any(item.player_clients for item in attempts):
         add("", "", (), "默认")
+    # 403 / Cloudflare 才走到这一次。默认仍不带 Cookie。
+    add("", "", (), "浏览器指纹", impersonate=True)
     return attempts
 
 
@@ -355,6 +398,8 @@ def _reraise_extract_error(exc: BaseException) -> None:
         text.startswith("Cookie 文件不存在")
         or text.startswith("不支持的浏览器")
         or YOUTUBE_COOKIES_NEEDED in text
+        or IMPERSONATE_STILL_BLOCKED in text
+        or IMPERSONATE_DEPENDENCY_MISSING in text
     ):
         raise exc
     if "已取消" in text:
@@ -367,12 +412,33 @@ def _opts_for_attempt(base: dict[str, Any], attempt: _ExtractAttempt) -> dict[st
     opts.pop("cookiefile", None)
     opts.pop("cookiesfrombrowser", None)
     opts.pop("extractor_args", None)
+    opts.pop("impersonate", None)
     apply_cookie_options(opts, attempt.cookiefile, attempt.cookiesfrombrowser)
+    extractor_args: dict[str, Any] = {}
     if attempt.player_clients:
-        opts["extractor_args"] = {
-            "youtube": {"player_client": list(attempt.player_clients)}
-        }
+        extractor_args["youtube"] = {"player_client": list(attempt.player_clients)}
+    if attempt.impersonate:
+        # 全局 --impersonate 覆盖后续媒体请求；generic:impersonate 覆盖网页这一下。
+        # Cloudflare 经常网页过了、视频地址仍 403，所以两个都要。
+        opts["impersonate"] = _impersonate_target()
+        extractor_args["generic"] = {"impersonate": ["chrome"]}
+    if extractor_args:
+        opts["extractor_args"] = extractor_args
     return opts
+
+
+def _attempt_uses_cookies(attempt: _ExtractAttempt) -> bool:
+    if (attempt.cookiefile or "").strip():
+        return True
+    try:
+        return bool(normalize_browser(attempt.cookiesfrombrowser))
+    except RuntimeError:
+        return bool((attempt.cookiesfrombrowser or "").strip())
+
+
+def _impersonate_log(attempt: _ExtractAttempt) -> str:
+    cookies = "使用已填写的 Cookie" if _attempt_uses_cookies(attempt) else "不使用 Cookie"
+    return f"遇到 HTTP 403 / Cloudflare，正在用浏览器指纹重试（{cookies}）…"
 
 
 def _extract_with_retries(
@@ -388,14 +454,17 @@ def _extract_with_retries(
     """按尝试列表调用 yt-dlp。YouTube 上可重试的失败换下一个客户端。"""
     yt_dlp = _import_yt_dlp()
     youtube = is_youtube_url(url)
-    total = len(attempts)
+    client_attempts = [item for item in attempts if not item.impersonate]
+    client_total = len(client_attempts)
     last_retryable: Optional[BaseException] = None
 
     for index, attempt in enumerate(attempts, start=1):
         if cancel_event is not None and cancel_event.is_set():
             raise RuntimeError("已取消")
-        if youtube and total > 1:
-            log(_attempt_log(attempt, index, total))
+        if attempt.impersonate:
+            log(_impersonate_log(attempt))
+        elif youtube and client_total > 1:
+            log(_attempt_log(attempt, index, client_total))
         try:
             opts = _opts_for_attempt(base_opts, attempt)
             with yt_dlp.YoutubeDL(opts) as ydl:
@@ -408,19 +477,36 @@ def _extract_with_retries(
         except Exception as exc:
             if cancel_event is not None and cancel_event.is_set():
                 raise
-            if "已取消" in str(exc):
+            text = str(exc)
+            if "已取消" in text:
                 raise
+            if (
+                IMPERSONATE_DEPENDENCY_MISSING in text
+                or IMPERSONATE_STILL_BLOCKED in text
+                or YOUTUBE_COOKIES_NEEDED in text
+            ):
+                raise
+            nxt = attempts[index] if index < len(attempts) else None
             if is_format_unavailable(exc):
-                if youtube and index < total:
+                if youtube and nxt is not None and not nxt.impersonate:
                     log("这个客户端没有可合并的音视频格式，正在改试下一个客户端…")
                     continue
                 raise RuntimeError(FORMAT_NEEDS_AUDIO) from exc
-            if youtube and is_youtube_client_retryable(exc) and index < total:
+            if youtube and is_youtube_client_retryable(exc) and nxt is not None:
+                if nxt.impersonate and not is_impersonate_retryable(exc):
+                    raise RuntimeError(YOUTUBE_COOKIES_NEEDED) from exc
                 last_retryable = exc
-                log(f"本次未成功（{youtube_retry_reason(exc)}），正在改试下一个客户端…")
+                if not nxt.impersonate:
+                    log(f"本次未成功（{youtube_retry_reason(exc)}），正在改试下一个客户端…")
                 continue
             if youtube and is_youtube_client_retryable(exc):
                 raise RuntimeError(YOUTUBE_COOKIES_NEEDED) from exc
+            if nxt is not None and nxt.impersonate and is_impersonate_retryable(exc):
+                continue
+            if attempt.impersonate and is_impersonate_dependency_missing(exc):
+                raise RuntimeError(IMPERSONATE_DEPENDENCY_MISSING) from exc
+            if attempt.impersonate and is_impersonate_retryable(exc):
+                raise RuntimeError(IMPERSONATE_STILL_BLOCKED) from exc
             _reraise_extract_error(exc)
 
     raise RuntimeError(YOUTUBE_COOKIES_NEEDED) from last_retryable
@@ -816,6 +902,8 @@ def download(
         if is_youtube_url(opts.url):
             note += "（读取失败时会改为无 Cookie 重试）"
         log(note)
+    else:
+        log("默认不使用 Cookie。若站点返回 403 或 Cloudflare 验证，会自动用浏览器指纹再试一次。")
 
     if cancel_event and cancel_event.is_set():
         raise RuntimeError("已取消")

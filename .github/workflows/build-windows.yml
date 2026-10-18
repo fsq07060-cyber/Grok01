@@ -30,6 +30,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt pyinstaller
 
+      - name: Verify impersonation dependency
+        run: |
+          python -c "import curl_cffi; from yt_dlp.networking.impersonate import ImpersonateTarget; from yt_dlp import YoutubeDL; ydl = YoutubeDL({'quiet': True, 'skip_download': True, 'impersonate': ImpersonateTarget(client='chrome')}); print('curl_cffi', curl_cffi.__version__); print('impersonate', ydl.params.get('impersonate'))"
+
       - name: Download Windows ffmpeg (BtbN static, exe only)
         shell: pwsh
         run: |
@@ -62,6 +66,39 @@ jobs:
             Copy-Item "ffmpeg\bin\*.exe" "dist\StreamDownloader\ffmpeg\bin\" -Force
           }
           Get-ChildItem "dist\StreamDownloader" -Recurse -Depth 2 | Select-Object FullName, Length | Format-Table -AutoSize
+
+      - name: Assert curl_cffi is bundled
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $internal = "dist\StreamDownloader\_internal"
+          if (-not (Test-Path $internal)) {
+            throw "missing $internal"
+          }
+          $dlls = @(Get-ChildItem -Path $internal -Recurse -Filter "libcurl-impersonate*.dll")
+          if ($dlls.Count -lt 1) {
+            throw "libcurl-impersonate DLL was not bundled; users would be told to pip install curl_cffi"
+          }
+          $wrapper = @(Get-ChildItem -Path $internal -Recurse -Filter "_wrapper*.pyd")
+          if ($wrapper.Count -lt 1) {
+            throw "curl_cffi _wrapper.pyd was not bundled"
+          }
+          $libs = Get-ChildItem -Path $internal -Recurse -Directory -Filter "curl_cffi.libs" | Select-Object -First 1
+          if (-not $libs) {
+            throw "curl_cffi.libs directory missing from the bundle"
+          }
+          $pkg = Get-ChildItem -Path $internal -Recurse -Directory -Filter "curl_cffi" |
+            Where-Object { $_.Name -eq "curl_cffi" } |
+            Select-Object -First 1
+          if (-not $pkg) {
+            throw "curl_cffi package directory missing from the bundle"
+          }
+          if ($libs.Parent.FullName -ne $pkg.Parent.FullName) {
+            throw "curl_cffi.libs ($($libs.FullName)) is not a sibling of curl_cffi ($($pkg.FullName)). delvewheel will not find libcurl-impersonate."
+          }
+          Write-Host "Bundled impersonation libraries:"
+          $dlls | Format-Table FullName, Length
+          $wrapper | Format-Table FullName, Length
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

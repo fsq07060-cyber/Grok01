@@ -92,8 +92,11 @@ class YoutubeAttemptTests(unittest.TestCase):
                 ("tv_samsung",),
                 ("web_embedded",),
                 ("tv_downgraded",),
+                (),
             ],
         )
+        self.assertTrue(attempts[-1].impersonate)
+        self.assertFalse(any(a.impersonate for a in attempts[:-1]))
         flat = {name for group in clients for name in group}
         self.assertNotIn("android", flat)
         self.assertNotIn("ios", flat)
@@ -121,11 +124,13 @@ class YoutubeAttemptTests(unittest.TestCase):
         self.assertEqual(attempts[1].player_clients, ("visionos",))
         self.assertEqual(attempts[2].player_clients, ("web_embedded",))
 
-    def test_non_youtube_is_single_attempt_without_player_client(self) -> None:
+    def test_non_youtube_keeps_optional_cookies_and_adds_impersonate_retry(self) -> None:
         attempts = build_extract_attempts("https://example.com/v", "", "chrome")
-        self.assertEqual(len(attempts), 1)
-        self.assertEqual(attempts[0].player_clients, ())
-        self.assertEqual(attempts[0].cookiesfrombrowser, "chrome")
+        self.assertEqual(len(attempts), 2)
+        self.assertFalse(attempts[0].impersonate)
+        self.assertTrue(attempts[1].impersonate)
+        self.assertTrue(all(a.player_clients == () for a in attempts))
+        self.assertTrue(all(a.cookiesfrombrowser == "chrome" for a in attempts))
 
 
 class YoutubeRetryTests(unittest.TestCase):
@@ -225,12 +230,17 @@ class YoutubeRetryTests(unittest.TestCase):
         self.assertEqual(str(ctx.exception), FORMAT_NEEDS_AUDIO)
         self.assertIsNone(_clients(_FakeYDL.calls[0]))
 
-    def test_non_youtube_403_does_not_retry_or_set_player_client(self) -> None:
-        with _install_fake([RuntimeError("HTTP Error 403: Forbidden")]):
+    def test_non_youtube_403_retries_with_impersonate_not_youtube_clients(self) -> None:
+        from core.errors import IMPERSONATE_STILL_BLOCKED
+
+        with _install_fake([RuntimeError("HTTP Error 403: Forbidden")] * 2):
             with self.assertRaises(RuntimeError) as ctx:
                 list_formats("https://example.com/v")
-        self.assertEqual(len(_FakeYDL.calls), 1)
+        self.assertEqual(len(_FakeYDL.calls), 2)
         self.assertIsNone(_clients(_FakeYDL.calls[0]))
+        self.assertIsNone(_clients(_FakeYDL.calls[1]))
+        self.assertNotIn("impersonate", _FakeYDL.calls[0])
+        self.assertEqual(str(ctx.exception), IMPERSONATE_STILL_BLOCKED)
         self.assertNotIn(YOUTUBE_COOKIES_NEEDED, str(ctx.exception))
 
     def test_download_retries_same_chain(self) -> None:

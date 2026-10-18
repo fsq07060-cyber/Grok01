@@ -28,6 +28,7 @@ python main.py
 | 失效视频（HTTP 410/404）中文提示 | v1.2 |
 | YouTube 默认不读 Cookie，403 / 登录确认时自动换客户端 | v1.3 |
 | 默认下载合并画面和声音；mp4 优先 aac/m4a；无音轨则重试并失败 | v1.3.1 |
+| Cloudflare / HTTP 403 先用浏览器指纹重试；Cookie 仍默认关闭 | v1.3.2 |
 | 人声/伴奏分离（Demucs） | v2（UI 开关 + stub） |
 
 ## 使用提示
@@ -38,14 +39,21 @@ python main.py
 4. **删除**：未完成会取消并移除；已完成仅从列表移除。  
 5. 剪贴板监听开启时，检测到链接会询问是否追加到输入框。
 6. 默认视频下载会合并一条音轨（mp4 优先 aac/m4a，便于直接封装），不会保存只有画面的文件。下载后用 ffprobe 检查；没有音轨会自动换带声音的格式重试一次，仍然没有则该任务失败。窗口标题含版本号，v1.3.1 起才有这项检查。
+7. 默认不读取浏览器 Cookie。遇到 HTTP 403 或 Cloudflare 验证时，会先用浏览器指纹再试一次。年龄限制、较重的 Cloudflare 验证或 DRM 仍可能失败，不能保证每个网站都能下载。仍失败时，再选浏览器 Cookie 或 Netscape Cookie 文件。窗口标题含 v1.3.2 起才有这项自动重试。
 
 ## YouTube
 
 普通公开视频默认不读 Cookie。程序会按 yt-dlp 2026.10 的推荐客户端依次尝试 `tv_samsung`、`visionos`、`web`，失败再试 `visionos`、`web_embedded`、`tv_downgraded`（不使用已删除的 `tv_embedded`，也不使用没有 PO Token 就会 403 的 `android` / `ios` / `mweb`）。HTTP 403、「Sign in to confirm」或 Cookie 读失败会自动换下一个客户端。本机有 Deno 或 Node 时，`tv_samsung` / `web` 的清晰度更完整；没有时仍会用 `visionos`（不需要 JS）。
 
-年龄限制或部分地区封锁的视频仍可能需要 Cookie，不能保证每条都成功。最后才需要：在「浏览器 Cookie」选 **chrome** / **edge** / **firefox**，或填写 Netscape 格式的 `cookies.txt`。两条都填时会一起传给 yt-dlp。浏览器正在占用 Cookie 数据库时可能读失败，关掉浏览器或改用导出的文件即可；读失败后仍会再试无 Cookie 客户端。
+年龄限制或部分地区封锁的视频仍可能需要 Cookie，不能保证每条都成功。YouTube 客户端都因 HTTP 403 失败时，会再用浏览器指纹试一次，然后才提示 Cookie。最后才需要：在「浏览器 Cookie」选 **chrome** / **edge** / **firefox**，或填写 Netscape 格式的 `cookies.txt`。两条都填时会一起传给 yt-dlp。默认选项是「不使用」。浏览器正在占用 Cookie 数据库时可能读失败，关掉浏览器或改用导出的文件即可；读失败后仍会再试无 Cookie 客户端。
 
-Pornhub 等站点返回 **HTTP 410 / 404** 表示该视频已删除或下架，换一条还能打开的链接即可，不是下载器坏了。
+## 其它站点（Cloudflare）
+
+普通请求失败且返回 HTTP 403 或 Cloudflare 验证时，程序会自动加上 yt-dlp 的 `--impersonate chrome`，以及 `generic:impersonate=chrome`。Windows 安装包里已经带了 `curl_cffi` 和 `libcurl-impersonate`，不用再执行 `pip install`。
+
+这一步解决的是「站点按 TLS 指纹把脚本拦在门外」这一类问题。年龄门槛、要人工点选的 Cloudflare、DRM 仍然可能失败。界面上的说明也是这个口径，不是「所有网站都能下」。
+
+Pornhub 等站点返回 **HTTP 410 / 404** 表示该视频已删除或下架，换一条还能打开的链接即可，不是下载器坏了。不会因此去改浏览器指纹。
 
 ## 打包（GitHub Actions）
 
